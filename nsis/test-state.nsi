@@ -37,51 +37,10 @@ Var PrevAlive
 Var Tmp1
 Var Tmp2
 
-; ---- 被测逻辑：与 RustDeskLite.nsi 中的同名函数保持一致 ----
-Function ReadState
-  StrCpy $PrevSvc 0
-  StrCpy $PrevApp 0
-  StrCpy $PrevAlive 0
-  ClearErrors
-  ReadINIStr $Tmp1 "$StateDir\state.ini" "state" "First"
-  ${If} ${Errors}
-    Return
-  ${EndIf}
-
-  ; 跨开机判定：GetTickCount 在重启后变小，用来识别"上次开机遗留"
-  ClearErrors
-  ReadINIStr $Tmp2 "$StateDir\state.ini" "state" "Ticks"
-  ${If} ${Errors}
-    StrCpy $Tmp2 0
-  ${EndIf}
-  System::Call 'kernel32::GetTickCount() i .r1'
-  ${If} $1 < $Tmp2
-    Delete "$StateDir\state.ini"
-    Return
-  ${EndIf}
-
-  StrCpy $PrevAlive 1
-  ReadINIStr $Tmp1 "$StateDir\state.ini" "state" "HadSvc"
-  StrCpy $PrevSvc $Tmp1
-  ReadINIStr $Tmp1 "$StateDir\state.ini" "state" "HadApp"
-  StrCpy $PrevApp $Tmp1
-FunctionEnd
-
-Function WriteState
-  CreateDirectory $StateDir
-  WriteINIStr "$StateDir\state.ini" "state" "First"    "1"
-  WriteINIStr "$StateDir\state.ini" "state" "HadSvc"   "$WasSvc"
-  WriteINIStr "$StateDir\state.ini" "state" "HadApp"   "$WasApp"
-  WriteINIStr "$StateDir\state.ini" "state" "Stamp"    "${BUILD_DATE_TEXT}"
-  System::Call 'kernel32::GetCurrentProcessId() i .r1'
-  WriteINIStr "$StateDir\state.ini" "state" "OwnerPid" "$1"
-  System::Call 'kernel32::GetTickCount() i .r1'
-  WriteINIStr "$StateDir\state.ini" "state" "Ticks"    "$1"
-FunctionEnd
-
-Function ClearState
-  Delete "$StateDir\state.ini"
-FunctionEnd
+; ---- 被测逻辑：直接 include 产品用的同一份实现 ----
+; 不要再在这里手抄副本。之前抄了一份，改了 RustDeskLite.nsi 里的 ClearState
+; （加 RMDir 删目录）却忘了同步副本，测试就报了两个假 FAIL。
+!include "state.nsh"
 
 !macro CheckLabel NAME EXPECTED GOT
   Push $0
@@ -99,6 +58,29 @@ Section
   Delete "${LOG}"
   FileOpen $9 "${LOG}" w
   FileWrite $9 "=== state hand-off unit test ===$\r$\n"
+
+  ; 0. 产品默认的状态目录必须独立于解压目录 —— 解压目录在拿到锁后立刻被
+  ;    rmdir（被占用时还会改名），状态文件放进去就会在"正要读它继承"时被删掉。
+  ;    注意这里比的是**完整路径**，不能用前缀判断：
+  ;    "$TEMP\RustDeskLite" 的字符串前缀恰好也是 "$TEMP\RustDesk"。
+  Call InitState
+  Push $0
+  Push $1
+  StrCpy $0 "$TEMP\RustDeskLite"
+  StrCpy $1 "$TEMP\RustDesk"
+  ${If} $StateDir == $0
+    FileWrite $9 "[PASS] 0 InitState returns TEMP\RustDeskLite$\r$\n"
+  ${Else}
+    FileWrite $9 "[FAIL] 0 InitState expected=$0 got=$StateDir$\r$\n"
+  ${EndIf}
+  ${If} $StateDir == $1
+    FileWrite $9 "[FAIL] 0 state dir must NOT be the extract dir$\r$\n"
+  ${Else}
+    FileWrite $9 "[PASS] 0 state dir differs from extract dir$\r$\n"
+  ${EndIf}
+  Pop $1
+  Pop $0
+  StrCpy $StateDir "${STATE_DIR}"    ; 后续用例改用测试临时目录
 
   ; 1. 没有状态文件 = 首次运行，什么都不继承
   Delete "$StateDir\state.ini"
@@ -138,15 +120,34 @@ Section
     FileWrite $9 "[PASS] 5 stale file deleted$\r$\n"
   ${EndIf}
 
-  ; 6. 恢复完必须能清干净
+  ; 6. 恢复完必须能清干净 —— 连目录一起删（状态只在运行期间有意义）
   StrCpy $WasSvc 1
   StrCpy $WasApp 1
   Call WriteState
   Call ClearState
   ${If} ${FileExists} "$StateDir\state.ini"
-    FileWrite $9 "[FAIL] 6 ClearState did not delete$\r$\n"
+    FileWrite $9 "[FAIL] 6 ClearState did not delete file$\r$\n"
   ${Else}
-    FileWrite $9 "[PASS] 6 ClearState deletes$\r$\n"
+    FileWrite $9 "[PASS] 6 ClearState deletes file$\r$\n"
+  ${EndIf}
+  ${If} ${FileExists} "$StateDir\*.*"
+    FileWrite $9 "[FAIL] 6 state dir should be removed$\r$\n"
+  ${Else}
+    FileWrite $9 "[PASS] 6 state dir removed$\r$\n"
+  ${EndIf}
+
+  ; 7. 陈旧状态连同目录一起清掉（跨开机遗留的残留）
+  CreateDirectory $StateDir
+  StrCpy $WasSvc 1
+  StrCpy $WasApp 1
+  Call WriteState
+  WriteINIStr "$StateDir\state.ini" "state" "Ticks" "2147483000"
+  Call ReadState
+  !insertmacro CheckLabel "7 stale PrevAlive=0" "0" "$PrevAlive"
+  ${If} ${FileExists} "$StateDir\*.*"
+    FileWrite $9 "[FAIL] 7 stale dir should be removed$\r$\n"
+  ${Else}
+    FileWrite $9 "[PASS] 7 stale dir removed$\r$\n"
   ${EndIf}
 
   FileWrite $9 "=== done ===$\r$\n"

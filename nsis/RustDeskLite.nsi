@@ -109,17 +109,27 @@ Var AppDir       ; 程序实际所在目录（Hook 依赖它的名字必须叫 R
 Var WasSvc       ; 运行前服务是否在跑
 Var WasApp       ; 运行前是否有 rustdesk 进程
 Var InstExe      ; 已安装的 rustdesk.exe 路径（用于还原托盘）
-Var StateDir     ; 启动器自己的状态目录（记录正式版运行状态）
+Var StateDir     ; 启动器状态目录（记录正式版运行状态），退出时整个删掉
 Var PrevSvc      ; 从状态文件读回：正式版服务是否原本在跑
 Var PrevApp      ; 从状态文件读回：正式版托盘程序是否原本在跑
 Var PrevAlive    ; 上面的状态是否来自一个仍在运行的实例
 Var Tmp1
 Var Tmp2
 
+; 正式版运行状态的持久化（跨实例交接）见 state.nsh。
+; 必须放在上面这些 Var 声明之后 —— state.nsh 里的函数直接引用 $StateDir 等变量，
+; include 时若变量还没声明，NSIS 会按 StrCpy 的参数个数报错。
+!include "state.nsh"
+
 ; ================================ 初始化 ====================================
 Function .onInit
   Call CheckTrial
-  StrCpy $StateDir "$LOCALAPPDATA\RustDeskLite"
+
+  ; 状态目录必须独立于解压目录 $TEMP\RustDesk：
+  ; 那个目录在拿到锁后第一件事就是 rmdir（且被占用时会改名成 RustDesk-<uniq>，
+  ; 路径不固定），状态文件放进去会在"新版本杀掉旧实例、正要去读它继承"时被自己删掉。
+  ; 放 %TEMP%\RustDeskLite 既不会被误删，退出时又能整个删干净（不留痕迹）。
+  Call InitState
 
   ; 互斥：避免重复双击、或上一次的清理还没结束
   StrCpy $5 0
@@ -247,71 +257,9 @@ Function ShowFrontWindow
 FunctionEnd
 
 ; =================== 正式版运行状态的持久化（交接给后续实例） ===================
-; 为什么要落盘：新版本接管时会先 kill 掉旧实例，旧实例的清理代码根本来不及跑，
-; 它记在内存里的 WasSvc / WasApp 就丢了。清理时就会"看不到原本在跑"，
-; 于是退出后不去恢复正式版的服务/托盘 —— 用户会以为正式版被弄坏了。
-;
-; 所以把状态写进 %LOCALAPPDATA%\RustDeskLite\state.ini，并且**只由第一个实例写**：
-;   First=1  表示服务/托盘已被本工具停掉，退出时由继承了这份状态的实例负责恢复
-;   First=0  表示没动过正式版，退出时什么都不用恢复
-; 后续实例（新版本接管）读到这份文件就直接继承，不再重新探测 ——
-; 此刻正式版已经被停掉了，重新探测只会得到"没在跑"，就把原始状态弄丢了。
-
-; 读出已有状态到 $PrevSvc / $PrevApp / $PrevAlive
-Function ReadState
-  StrCpy $PrevSvc 0
-  StrCpy $PrevApp 0
-  StrCpy $PrevAlive 0
-  ClearErrors
-  ReadINIStr $Tmp1 "$StateDir\state.ini" "state" "First"
-  ${If} ${Errors}
-    Return                 ; 没有状态文件：首次运行，自己去探测
-  ${EndIf}
-
-  ; 只要有状态文件就继承，不再重新探测。理由是两种情形都必须继承：
-  ;   1) 写状态的实例还活着（不同编译版本在跑，互斥互相看不见）→ 正式版已被它停掉；
-  ;   2) 它已经被我们 kill 掉 → 清理代码没跑，恢复的责任正好转给我们。
-  ; 这两种情形下"正式版现在没在跑"都**不代表**它原本没在跑，
-  ; 重新探测只会把原始状态覆盖成 0，退出后就不恢复了。
-
-  ; 唯一的例外是状态文件来自上一次开机（实例被强杀后没清理，又重启了机器）。
-  ; GetTickCount 是"开机后的毫秒数"，重启会归零变小 —— 借此判断跨了开机。
-  ClearErrors
-  ReadINIStr $Tmp2 "$StateDir\state.ini" "state" "Ticks"
-  ${If} ${Errors}
-    StrCpy $Tmp2 0
-  ${EndIf}
-  System::Call 'kernel32::GetTickCount() i .r1'
-  ${If} $1 < $Tmp2
-    Delete "$StateDir\state.ini"
-    Return                 ; 跨开机 → 视为陈旧，丢弃后重新探测
-  ${EndIf}
-
-  StrCpy $PrevAlive 1
-
-  ReadINIStr $Tmp1 "$StateDir\state.ini" "state" "HadSvc"
-  StrCpy $PrevSvc $Tmp1
-  ReadINIStr $Tmp1 "$StateDir\state.ini" "state" "HadApp"
-  StrCpy $PrevApp $Tmp1
-FunctionEnd
-
-; 写入状态（$WasSvc / $WasApp 为本次探测结果）
-Function WriteState
-  CreateDirectory $StateDir
-  WriteINIStr "$StateDir\state.ini" "state" "First"    "1"
-  WriteINIStr "$StateDir\state.ini" "state" "HadSvc"   "$WasSvc"
-  WriteINIStr "$StateDir\state.ini" "state" "HadApp"   "$WasApp"
-  WriteINIStr "$StateDir\state.ini" "state" "Stamp"    "${BUILD_DATE_TEXT}"
-  System::Call 'kernel32::GetCurrentProcessId() i .r1'
-  WriteINIStr "$StateDir\state.ini" "state" "OwnerPid" "$1"
-  System::Call 'kernel32::GetTickCount() i .r1'
-  WriteINIStr "$StateDir\state.ini" "state" "Ticks"    "$1"
-FunctionEnd
-
-; 清理：自己退出前删掉状态文件（谁恢复谁负责）
-Function ClearState
-  Delete "$StateDir\state.ini"
-FunctionEnd
+; 实现见 state.nsh（InitState / ReadState / WriteState / ClearState）。
+; 抽成单独文件是为了让 nsis\test-state.nsi 直接 include 同一份代码 ——
+; 之前测试里放的是手抄副本，改了产品代码忘了同步副本，测试就会谎报通过。
 
 ; ================================== 主体 ====================================
 Section "main"
