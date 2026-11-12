@@ -52,9 +52,29 @@ ${StrStr}
 !ifndef APP_VERSION
   !define APP_VERSION "1.0.0.0"
 !endif
+; 启动器自身的进程名（用于"未命中互斥时清掉旧版本实例"）。
+; 与 APP_IMAGE（被启动的 rustdesk.exe）是两回事，别混。
+!ifndef LAUNCHER_IMAGE
+  !define LAUNCHER_IMAGE "RustDeskLite.exe"
+!endif
 
 ; 有效期（编译时间常量、到期拒绝运行）见 trial.nsh
 !include "trial.nsh"
+
+; ---------------------------- 并发实例互斥 ----------------------------
+; 互斥名里带一个「编译期 GUID」，所以互斥只在**同一次编译出的 exe** 之间生效：
+;
+;   命中互斥  → 同版本已有实例在跑（重复双击）→ 激活它的窗口，自己退出
+;   未命中    → 说明没有同版本实例；可能还留着别的编译版本在跑
+;               → 先杀掉它的进程树再接管（否则两个实例会互踩临时目录）
+;
+; 为什么不用固定名字：固定名字只能防重复双击，换版本时新 exe 会被旧实例
+; 挡住（直接退出），用户只能先去托盘退出旧版。带 GUID 后新版本可以直接接管。
+!ifndef LAUNCH_GUID
+  ; 单独编译（不经 build.ps1、没传 /DLAUNCH_GUID）时的兜底：
+  ; 用编译时间戳，同样能保证每次编译唯一
+  !define /date LAUNCH_GUID "%Y%m%d%H%M%S"
+!endif
 
 Name "${APP_NAME}"
 Caption "${APP_NAME}"
@@ -89,25 +109,30 @@ Var AppDir       ; 程序实际所在目录（Hook 依赖它的名字必须叫 R
 Var WasSvc       ; 运行前服务是否在跑
 Var WasApp       ; 运行前是否有 rustdesk 进程
 Var InstExe      ; 已安装的 rustdesk.exe 路径（用于还原托盘）
+Var StateDir     ; 启动器自己的状态目录（记录正式版运行状态）
+Var PrevSvc      ; 从状态文件读回：正式版服务是否原本在跑
+Var PrevApp      ; 从状态文件读回：正式版托盘程序是否原本在跑
+Var PrevAlive    ; 上面的状态是否来自一个仍在运行的实例
 Var Tmp1
 Var Tmp2
 
 ; ================================ 初始化 ====================================
 Function .onInit
   Call CheckTrial
+  StrCpy $StateDir "$LOCALAPPDATA\RustDeskLite"
 
   ; 互斥：避免重复双击、或上一次的清理还没结束
   StrCpy $5 0
   rd_mutex:
     ; 必须先清零 last error：CreateMutexW 成功时不会重置它，残留的 183 会被误判成“已有实例”
     System::Call 'kernel32::SetLastError(i 0)'
-    System::Call 'kernel32::CreateMutexW(p 0, i 0, w "RustDeskLitePortableLauncher") i .r4 ?e'
+    System::Call 'kernel32::CreateMutexW(p 0, i 0, w "RustDeskLitePortableLauncher_${LAUNCH_GUID}") i .r4 ?e'
     Pop $6
     ${If} $6 != 183
       Goto rd_owned          ; 拿到锁：正常启动流程
     ${EndIf}
 
-    ; ---- 已有实例在跑 ----
+    ; ---- 命中了互斥：同一次编译出的实例已经在跑 ----
     System::Call 'kernel32::CloseHandle(p r4)'
     Call FindPortableWindow
     ${If} $R3 != 0
@@ -123,6 +148,21 @@ Function .onInit
     Quit
 
   rd_owned:
+    ; ---- 没命中互斥：没有同版本实例，但可能残留别的编译版本 ----
+    ; 不同编译的互斥名不同，所以它们彼此"看不见"，会抢同一个 %TEMP%\RustDesk
+    ; 临时目录、互相删对方的文件。这里先按 exe 名把旧实例（含其进程树）清掉。
+    ;
+    ; 两个必须的细节：
+    ;   1) 排除自己 —— 不加 /FI "PID ne <自己>" 会把自己也杀掉；
+    ;   2) 带 /T —— 旧实例的 rustdesk.exe 是它的子进程，只杀父进程会留孤儿
+    ;      继续占着临时目录，下面 rmdir 就删不掉。
+    System::Call 'kernel32::GetCurrentProcessId() i .R0'
+    nsExec::Exec 'taskkill /F /T /FI "IMAGENAME eq ${LAUNCHER_IMAGE}" /FI "PID ne $R0"'
+    Pop $1
+    ; 退 128 = 没有匹配的进程（正常情况：本来就没有旧实例）
+    ${If} $1 != 128
+      Sleep 500              ; 等文件锁释放，否则临时目录删不干净
+    ${EndIf}
 
   ; 清掉早期版本留下的 ~rd* 临时目录
   FindFirst $1 $2 "$TEMP\~rd*"
@@ -206,6 +246,73 @@ Function ShowFrontWindow
   ${EndIf}
 FunctionEnd
 
+; =================== 正式版运行状态的持久化（交接给后续实例） ===================
+; 为什么要落盘：新版本接管时会先 kill 掉旧实例，旧实例的清理代码根本来不及跑，
+; 它记在内存里的 WasSvc / WasApp 就丢了。清理时就会"看不到原本在跑"，
+; 于是退出后不去恢复正式版的服务/托盘 —— 用户会以为正式版被弄坏了。
+;
+; 所以把状态写进 %LOCALAPPDATA%\RustDeskLite\state.ini，并且**只由第一个实例写**：
+;   First=1  表示服务/托盘已被本工具停掉，退出时由继承了这份状态的实例负责恢复
+;   First=0  表示没动过正式版，退出时什么都不用恢复
+; 后续实例（新版本接管）读到这份文件就直接继承，不再重新探测 ——
+; 此刻正式版已经被停掉了，重新探测只会得到"没在跑"，就把原始状态弄丢了。
+
+; 读出已有状态到 $PrevSvc / $PrevApp / $PrevAlive
+Function ReadState
+  StrCpy $PrevSvc 0
+  StrCpy $PrevApp 0
+  StrCpy $PrevAlive 0
+  ClearErrors
+  ReadINIStr $Tmp1 "$StateDir\state.ini" "state" "First"
+  ${If} ${Errors}
+    Return                 ; 没有状态文件：首次运行，自己去探测
+  ${EndIf}
+
+  ; 只要有状态文件就继承，不再重新探测。理由是两种情形都必须继承：
+  ;   1) 写状态的实例还活着（不同编译版本在跑，互斥互相看不见）→ 正式版已被它停掉；
+  ;   2) 它已经被我们 kill 掉 → 清理代码没跑，恢复的责任正好转给我们。
+  ; 这两种情形下"正式版现在没在跑"都**不代表**它原本没在跑，
+  ; 重新探测只会把原始状态覆盖成 0，退出后就不恢复了。
+
+  ; 唯一的例外是状态文件来自上一次开机（实例被强杀后没清理，又重启了机器）。
+  ; GetTickCount 是"开机后的毫秒数"，重启会归零变小 —— 借此判断跨了开机。
+  ClearErrors
+  ReadINIStr $Tmp2 "$StateDir\state.ini" "state" "Ticks"
+  ${If} ${Errors}
+    StrCpy $Tmp2 0
+  ${EndIf}
+  System::Call 'kernel32::GetTickCount() i .r1'
+  ${If} $1 < $Tmp2
+    Delete "$StateDir\state.ini"
+    Return                 ; 跨开机 → 视为陈旧，丢弃后重新探测
+  ${EndIf}
+
+  StrCpy $PrevAlive 1
+
+  ReadINIStr $Tmp1 "$StateDir\state.ini" "state" "HadSvc"
+  StrCpy $PrevSvc $Tmp1
+  ReadINIStr $Tmp1 "$StateDir\state.ini" "state" "HadApp"
+  StrCpy $PrevApp $Tmp1
+FunctionEnd
+
+; 写入状态（$WasSvc / $WasApp 为本次探测结果）
+Function WriteState
+  CreateDirectory $StateDir
+  WriteINIStr "$StateDir\state.ini" "state" "First"    "1"
+  WriteINIStr "$StateDir\state.ini" "state" "HadSvc"   "$WasSvc"
+  WriteINIStr "$StateDir\state.ini" "state" "HadApp"   "$WasApp"
+  WriteINIStr "$StateDir\state.ini" "state" "Stamp"    "${BUILD_DATE_TEXT}"
+  System::Call 'kernel32::GetCurrentProcessId() i .r1'
+  WriteINIStr "$StateDir\state.ini" "state" "OwnerPid" "$1"
+  System::Call 'kernel32::GetTickCount() i .r1'
+  WriteINIStr "$StateDir\state.ini" "state" "Ticks"    "$1"
+FunctionEnd
+
+; 清理：自己退出前删掉状态文件（谁恢复谁负责）
+Function ClearState
+  Delete "$StateDir\state.ini"
+FunctionEnd
+
 ; ================================== 主体 ====================================
 Section "main"
   SetShellVarContext current
@@ -273,6 +380,18 @@ Section "main"
 
 
   ; ---- 4. 记录并停止本机已有的 RustDesk（配置文件一律不碰） ----
+  ; 先看有没有前一个实例留下的状态：
+  ;   有且仍有效 → 直接继承，不再重新探测（此时正式版已被上一个实例停掉了，
+  ;                重新探测只会得到"没在跑"，会把原始状态弄丢）
+  ;   没有       → 自己探测，并把自己作为"首个实例"记录下来
+  Call ReadState
+  ${If} $PrevAlive == 1
+    StrCpy $WasSvc $PrevSvc
+    StrCpy $WasApp $PrevApp
+    StrCpy $7 0              ; 已经停过了，不用再问、也不用再停
+    Goto rd_run
+  ${EndIf}
+
   nsExec::ExecToStack 'sc query RustDesk'
   Pop $Tmp2
   Pop $Tmp1
@@ -301,13 +420,23 @@ Section "main"
   rd_cancel:
     nsExec::Exec 'cmd /c rmdir /s /q "$RootDir"'
     Pop $0
+    Call ClearState          ; 用户放弃：把记录清掉，别留下"假在跑"的状态
     Quit
   rd_stop:
+    ; 先落盘再动手：万一这个实例之后被新版本 kill 掉（来不及跑清理），
+    ; 下一个实例能从状态文件里继承"正式版原本在跑"，退出时照样能恢复。
+    Call WriteState
     nsExec::Exec 'sc stop RustDesk'
     nsExec::Exec 'taskkill /F /IM ${APP_IMAGE} /T'
     nsExec::Exec 'taskkill /F /IM RuntimeBroker_rustdesk.exe /T'
     Sleep 1200
   rd_run:
+    ; 走到这里若是"没探测到正式版在跑"的首次运行，也要记一笔，
+    ; 这样接管后退出时才知道需不需要恢复（First=1 + HadSvc/HadApp=0 → 不恢复）。
+    ${If} $7 == 0
+    ${AndIf} $PrevAlive == 0
+      Call WriteState
+    ${EndIf}
 
 
   ; ---- 5. 启动：先拉起托盘进程，再跑主程序并等待 ----
@@ -356,4 +485,7 @@ Section "main"
     ${EndIf}
     rd_no_restore:
   ${EndIf}
+
+  ; 恢复完才清状态：如果恢复过程中自己被杀，下一个实例还能接着恢复。
+  Call ClearState
 SectionEnd

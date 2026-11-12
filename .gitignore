@@ -13,6 +13,7 @@ askpass.bat
 /hook/out/
 /nsis/_trial/
 /nsis/_probe/
+/nsis/_state/
 *.obj
 *.exp
 *.lib

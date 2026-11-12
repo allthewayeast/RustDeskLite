@@ -273,6 +273,16 @@ $defs = @(
 )
 if (-not $AppImage) { $AppImage = $AppExeRel }
 $defs += "/DAPP_IMAGE=$AppImage"
+
+# 启动器自身的进程名：互斥未命中时用它清掉别的编译版本实例（必须与 OutFile 同名）
+$defs += "/DLAUNCHER_IMAGE=$([System.IO.Path]::GetFileName($OutFile))"
+
+# 每次编译生成一个新的 GUID，作为互斥名的一部分：
+#   同一次编译出的 exe 之间 → 互斥（重复双击走"激活已有窗口"）
+#   不同编译之间           → 不互斥（新版本直接接管旧实例，不用先去托盘退出）
+$launchGuid = [guid]::NewGuid().ToString('N')
+$defs += "/DLAUNCH_GUID=$launchGuid"
+Write-Host "    并发标识: $launchGuid（互斥名 RustDeskLitePortableLauncher_<此值>）" -ForegroundColor DarkGray
 if ($iconOk) { $defs += "/DAPP_ICON=$iconPath" }
 if ($Password) { $defs += '/DHAS_PW' }
 if (Test-Path (Join-Path $cfgDir 'RustDesk_local.toml')) { $defs += '/DHAS_LOCAL_CFG' }
