@@ -5,6 +5,8 @@ settings.local.psd1
 /payload/
 /dist/
 /hook/out/
+/nsis/_trial/
+/nsis/_probe/
 *.obj
 *.exp
 *.lib

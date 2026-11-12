@@ -23,6 +23,7 @@
 | 不砸已装版本 | 启动前记录服务与进程状态，退出后按原样恢复 |
 | 重复运行 | 已经开着时再双击，会把已有窗口还原并置前，而不是开第二个实例 |
 | 崩溃自愈 | 上次被强杀留下的临时目录、互斥锁会自愈，不会卡住下一次启动 |
+| 可设有效期 | 编译时把到期日写死进 exe，过期拒绝运行（默认 30 天，`-TrialDays 0` 关闭） |
 
 ---
 
@@ -100,7 +101,28 @@ RustDesk 的配置目录由 `hbb_common::config::Config::path()` 决定，Window
   的窗口时给菜单追加一项「退出 RustDesk」，并 subclass 该窗口的 `WndProc` 截获这个菜单 id，
   向主窗口发 `WM_CLOSE`（主程序退出后启动器会收尾清理）。
 
-### 2.3 构建产物为什么是"单文件"
+### 2.3 有效期（编译时间常量 + 到期拒绝运行）
+
+可以把包做成"只能用到某个日期"的限时版，实现见 `nsis\trial.nsh`：
+
+- **编译日期与到期日都是编译期常量**，构建时由 `build.ps1` 算好后通过
+  `/DBUILD_DATE=20261112`、`/DEXPIRE_DATE=20261212` 传给 NSIS，作为立即数编进代码；
+  同时写进 exe 的版本资源，右键属性就能核对（例如"编译于 2026-11-12 21:06:17；有效期 30 天，2026-12-12 到期"）。
+- **运行时不做日期推算**：只取本机今天的 `yyyyMMdd`，和 `EXPIRE_DATE` 做一次整数比较。
+  `yyyyMMdd` 是单调递增的整数，直接比大小就是正确的日期比较，闰年、跨月、跨年都不需要特判。
+- **到期日当天仍可运行**，`今天 > 到期日` 才拒绝启动。
+- **防时间回拨**：如果系统时间早于编译日期，直接按异常处理并退出，
+  避免把时钟调回去就能一直用。
+- 试 `-TrialDays 0` 可关闭限制。
+
+> 为什么不用 `${__DATE__}`：它的格式**跟随系统区域设置**（`2016/4/1`、`2026年11月12日`…），
+> 换台机器编译就可能解析失败，或把月/日切错位。计算一律用 `!define /date` 的纯数字格式
+> （走 `strftime`，与区域设置无关）或构建脚本传入的值；
+
+验证：`pwsh nsis\test-trial.ps1` —— 会编译一组极小 exe，检查常量是否写进 exe、
+到期日边界（剩 1 天 / 当天 / 过期 1 天）、时间回拨，以及兜底路径的日期换算与 .NET 是否一致。
+
+### 2.4 构建产物为什么是"单文件"
 
 `rustdesk.exe` 只有 386 KB，真正的内容是 `librustdesk.dll`(41 MB) + Flutter 引擎和 `data\`。
 Flutter 引擎必须在运行时从磁盘加载，无法静态链接进 exe，所以"单文件"只能是自解压壳 —— 本项目就是。
@@ -116,6 +138,8 @@ RustDeskLite/
 ├─ settings.local.psd1      本地私密配置（不提交，见 .gitignore）
 ├─ nsis/
 │  ├─ RustDeskLite.nsi      启动器脚本（解压 / 接管 / 启动 / 清理 / 唤起窗口）
+│  ├─ trial.nsh            有效期：编译时间常量、到期拒绝运行
+│  ├─ test-trial.ps1       有效期自测（边界 / 常量写入 / 时间回拨）
 │  └─ app.ico               程序图标（建议 256×256 多尺寸）
 └─ hook/
    ├─ sas_proxy.c           SAS.dll 源码：劫持 SHGetKnownFolderPath 等
@@ -171,6 +195,7 @@ pwsh build.ps1
     Key      = 'sB5oad...MEQ='           # hbbs 的 public key
 
     Password = ''                        # 固定密码，留空则每次随机
+    TrialDays = 30                       # 有效天数，0 或负数 = 不限制
 }
 ```
 
@@ -181,6 +206,7 @@ pwsh build.ps1
 | `-Source` | `C:\Program Files\RustDesk` | 官方安装目录 |
 | `-IdServer` / `-Key` | 来自 settings | 内置到 `RustDesk2.toml` |
 | `-Password` | 空 | 内置固定密码，写入 `RustDesk.toml`；留空则用随机临时密码 |
+| `-TrialDays` | `30` | 有效天数，编译时把到期日算好写死进 exe；`0` = 不限制 |
 | `-Mode lite\|full` | `lite` | `lite` 删除虚拟显示器驱动、打印机驱动等冗余 |
 | `-ExecLevel admin\|user` | `admin` | `user` 不弹 UAC，但无法停止已装版本的**服务** |
 | `-OutFile` | `dist\RustDeskLite.exe` | 输出路径 |

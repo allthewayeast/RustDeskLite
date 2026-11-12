@@ -53,6 +53,9 @@ ${StrStr}
   !define APP_VERSION "1.0.0.0"
 !endif
 
+; 有效期（编译时间常量、到期拒绝运行）见 trial.nsh
+!include "trial.nsh"
+
 Name "${APP_NAME}"
 Caption "${APP_NAME}"
 OutFile "${OUT_FILE}"
@@ -71,6 +74,15 @@ VIAddVersionKey /LANG=2052 "ProductName"     "${APP_NAME}"
 VIAddVersionKey /LANG=2052 "FileDescription" "${APP_NAME} - 便携启动器"
 VIAddVersionKey /LANG=2052 "FileVersion"     "${APP_VERSION}"
 VIAddVersionKey /LANG=2052 "LegalCopyright"  ""
+!if ${TRIAL_DAYS} > 0
+  !ifdef EXPIRE_DATE_TEXT
+    VIAddVersionKey /LANG=2052 "Comments" "编译于 ${BUILD_TIME_TEXT}；有效期 ${TRIAL_DAYS} 天，${EXPIRE_DATE_TEXT} 到期"
+  !else
+    VIAddVersionKey /LANG=2052 "Comments" "编译于 ${BUILD_TIME_TEXT}；有效期 ${TRIAL_DAYS} 天"
+  !endif
+!else
+  VIAddVersionKey /LANG=2052 "Comments" "编译于 ${BUILD_TIME_TEXT}"
+!endif
 
 Var RootDir      ; 解压根目录（清理时整棵删除）
 Var AppDir       ; 程序实际所在目录（Hook 依赖它的名字必须叫 RustDesk）
@@ -82,6 +94,8 @@ Var Tmp2
 
 ; ================================ 初始化 ====================================
 Function .onInit
+  Call CheckTrial
+
   ; 互斥：避免重复双击、或上一次的清理还没结束
   StrCpy $5 0
   rd_mutex:

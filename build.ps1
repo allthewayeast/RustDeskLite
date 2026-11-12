@@ -25,6 +25,7 @@ param(
   [string]$AppImage = '',
   [string]$AppArgs = '',
   [string]$HookDll = '',
+  [int]$TrialDays = -1,
   [switch]$ReusePayload,
   [switch]$SkipCompile,
   [switch]$NoIcon
@@ -61,6 +62,12 @@ $Password   = Pick 'Password'   ''
 $Mode       = Pick 'Mode'       'lite'
 $AppName    = Pick 'AppName'    'RustDesk Lite'
 $HookDll    = Pick 'HookDll'    (Join-Path $root 'hook\out\SAS.dll')
+
+# 有效期：0 或负数表示不限制；settings 里可写 TrialDays = 30
+if ($TrialDays -lt 0) {
+  if ($cfg.ContainsKey('TrialDays') -and "$($cfg['TrialDays'])" -ne '') { $TrialDays = [int]$cfg['TrialDays'] }
+  else { $TrialDays = 30 }
+}
 
 if (-not $IdServer) { throw '未配置 IdServer：请在 settings.local.psd1 里填写（参考 settings.psd1 模板），或传 -IdServer' }
 if (-not $Key)      { throw '未配置 Key：请在 settings.local.psd1 里填写（参考 settings.psd1 模板），或传 -Key' }
@@ -235,6 +242,22 @@ if (-not $AppImage) { $AppImage = $AppExeRel }
 $defs += "/DAPP_IMAGE=$AppImage"
 if ($iconOk) { $defs += "/DAPP_ICON=$iconPath" }
 if ($Password) { $defs += '/DHAS_PW' }
+$defs += "/DTRIAL_DAYS=$TrialDays"
+
+# 有效期：编译日期与到期日都在这里算好，作为常量写死进 exe。
+# 不用 ${__DATE__}（格式随系统区域设置变化），也不用运行期推算。
+if ($TrialDays -gt 0) {
+  $buildDate  = (Get-Date).Date
+  $expireDate = $buildDate.AddDays($TrialDays)
+  $defs += "/DBUILD_DATE=$($buildDate.ToString('yyyyMMdd'))"
+  $defs += "/DBUILD_DATE_TEXT=$($buildDate.ToString('yyyy-MM-dd'))"
+  $defs += "/DEXPIRE_DATE=$($expireDate.ToString('yyyyMMdd'))"
+  $defs += "/DEXPIRE_DATE_TEXT=$($expireDate.ToString('yyyy-MM-dd'))"
+  Write-Host ("    有效期: {0} 编译，{1} 到期（{2} 天）" -f `
+    $buildDate.ToString('yyyy-MM-dd'), $expireDate.ToString('yyyy-MM-dd'), $TrialDays) -ForegroundColor DarkGray
+} else {
+  Write-Host "    有效期: 不限制" -ForegroundColor DarkGray
+}
 
 & $NsisExe @defs $nsiPath
 if ($LASTEXITCODE -ne 0) { throw "makensis 编译失败，退出码 $LASTEXITCODE" }
