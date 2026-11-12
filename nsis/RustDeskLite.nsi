@@ -4,10 +4,11 @@
 ;  目录结构（平铺，无 app 子目录）：
 ;    %TEMP%\RustDesk\
 ;        rustdesk.exe  *.dll  data\           ← 官方文件
-;        SAS.dll                             ← 劫持壳（把 %APPDATA% 重定向到下面）
+;        SAS.dll                             ← 劫持壳（把 %APPDATA%\RustDesk 重定向到这里）
 ;        portable                            ← 通知壳：启用便携模式
-;        appdata\RustDesk\config\RustDesk2.toml  ← 内置 ID 服务器 / Key
-;        appdata\RustDesk\...                ← 运行时生成的配置与日志
+;        config\RustDesk2.toml               ← 内置 ID 服务器 / Key
+;        config\RustDesk.toml                ← 可选的固定密码
+;        config\、log\、peers\ ...            ← 运行时生成，退出即删
 ;
 ;  流程：清理旧残留 → 解压 → 写标记与配置 → 记录并停止已装 RustDesk
 ;        → 启动→ 等待退出 → 结束进程 → 删目录 → 恢复服务/托盘
@@ -71,7 +72,8 @@ VIAddVersionKey /LANG=2052 "FileDescription" "${APP_NAME} - 便携启动器"
 VIAddVersionKey /LANG=2052 "FileVersion"     "${APP_VERSION}"
 VIAddVersionKey /LANG=2052 "LegalCopyright"  ""
 
-Var RootDir      ; 解压目录 %TEMP%\RustDesk
+Var RootDir      ; 解压根目录（清理时整棵删除）
+Var AppDir       ; 程序实际所在目录（Hook 依赖它的名字必须叫 RustDesk）
 Var WasSvc       ; 运行前服务是否在跑
 Var WasApp       ; 运行前是否有 rustdesk 进程
 Var InstExe      ; 已安装的 rustdesk.exe 路径（用于还原托盘）
@@ -197,16 +199,30 @@ Section "main"
   StrCpy $WasSvc 0
   StrCpy $WasApp 0
 
-  ; ---- 1. 解压目录：%TEMP%\RustDesk；被占用则退回唯一名 ----
+  ; ---- 1. 解压目录：%TEMP%\RustDesk ----
+  ; Hook 把 Roaming 换成「程序目录的父目录」，RustDesk 再拼上自己的名字，
+  ; 所以程序目录必须叫 RustDesk，配置才会落在 <程序目录>\config。
   ; 用 cmd rmdir 静默删除：NSIS 的 RMDir 遇到被占用的文件会弹错误框并中止
   nsExec::Exec 'cmd /c rmdir /s /q "$TEMP\RustDesk"'
   Pop $0
   StrCpy $RootDir "$TEMP\RustDesk"
   ; 注意：不能用 IfFileExists "$dir\*.*" 判断目录是否存在——目录名没有扩展名时会误判
   System::Call 'kernel32::GetFileAttributesW(w "$RootDir")i .r1'
+  ${If} $1 != -1
+    ; 还被占用：多半是上次崩溃残留的进程，先按进程名清一次再重试
+    nsExec::Exec 'taskkill /F /IM ${APP_IMAGE} /T'
+    Sleep 800
+    nsExec::Exec 'cmd /c rmdir /s /q "$TEMP\RustDesk"'
+    Pop $0
+    System::Call 'kernel32::GetFileAttributesW(w "$RootDir")i .r1'
+  ${EndIf}
+
   ${If} $1 == -1
     CreateDirectory "$RootDir"
+    StrCpy $AppDir "$RootDir"
   ${Else}
+    ; 兜底：换个根名，但把程序放进其下的 RustDesk 子目录，
+    ; 这样「父目录 + RustDesk」仍然等于程序目录
     StrCpy $0 0
     rd_dir_uniq:
       IntOp $0 $0 + 1
@@ -217,20 +233,25 @@ Section "main"
       CreateDirectory $RootDir
       IfErrors 0 rd_dir_ready
       IntCmp $0 200 0 rd_dir_uniq rd_dir_uniq
+    rd_dir_ready:
+      StrCpy $AppDir "$RootDir\RustDesk"
+      CreateDirectory "$AppDir"
   ${EndIf}
-  rd_dir_ready:
 
 
   ; ---- 2. 解压官方文件（平铺：rustdesk.exe / *.dll / data\） ----
-  SetOutPath "$RootDir"
+  SetOutPath "$AppDir"
   File /r "${PAYLOAD_DIR}\app\*.*"
 
 
-  ; ---- 3. 便携标记 + 内置服务器配置 ----
-  FileOpen $3 "$RootDir\portable" w
+  ; ---- 3. 便携标记 + 内置配置 ----
+  FileOpen $3 "$AppDir\portable" w
   FileClose $3
-  SetOutPath "$RootDir\appdata\RustDesk\config"
+  SetOutPath "$AppDir\config"
   File "${PAYLOAD_DIR}\cfg\RustDesk2.toml"
+!ifdef HAS_PW
+  File "${PAYLOAD_DIR}\cfg\RustDesk.toml"
+!endif
 
 
   ; ---- 4. 记录并停止本机已有的 RustDesk（配置文件一律不碰） ----
@@ -273,14 +294,14 @@ Section "main"
 
   ; ---- 5. 启动：先拉起托盘进程，再跑主程序并等待 ----
   ; 便携模式上游不会自动建托盘图标（要求已安装且服务在跑），这里手动起一个 --tray
-  Exec '"$RootDir\${APP_EXE_REL}" --tray'
+  Exec '"$AppDir\${APP_EXE_REL}" --tray'
   Sleep 600
 
-  SetOutPath "$RootDir"
+  SetOutPath "$AppDir"
   ; SET_FOREGROUND_WINDOW=1：让 RustDesk 把主窗口提到前台
   System::Call 'kernel32::SetEnvironmentVariableW(w "SET_FOREGROUND_WINDOW", w "1")'
-  nsExec::Exec '"$RootDir\${APP_EXE_REL}" ${APP_ARGS}'
-  Pop $Tmp1
+  ; 必须用 ExecWait 而不是 nsExec：nsExec 带 SW_HIDE 启动，GUI 主窗口会被隐藏
+  ExecWait '"$AppDir\${APP_EXE_REL}" ${APP_ARGS}'
   System::Call 'kernel32::SetEnvironmentVariableW(w "SET_FOREGROUND_WINDOW", p 0)'
 
 

@@ -19,4 +19,7 @@
     IdServer    = ''                                            # 例：'rd.example.com' 或 '1.2.3.4:21116'
     Key         = ''                                            # 例：'sB5oad...MEQ='（hbbs 的 public key）
     RelayServer = ''                                            # 中继服务器，留空则由 ID 服务器下发（推荐）
+
+    # ---- 固定密码（可选） ----
+    Password    = ''                                            # 留空 = 用随机临时密码；填写后写入 RustDesk.toml
 }

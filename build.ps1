@@ -16,6 +16,7 @@ param(
   [string]$IdServer,
   [string]$Key,
   [string]$RelayServer,
+  [string]$Password,
   [ValidateSet('lite', 'full')][string]$Mode,
   [string]$AppName,
   [string]$OutFile,
@@ -56,6 +57,7 @@ $NsisExe    = Pick 'NsisExe'    (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makens
 $IdServer   = Pick 'IdServer'   ''
 $Key        = Pick 'Key'        ''
 $RelayServer= Pick 'RelayServer' ''
+$Password   = Pick 'Password'   ''
 $Mode       = Pick 'Mode'       'lite'
 $AppName    = Pick 'AppName'    'RustDesk Lite'
 $HookDll    = Pick 'HookDll'    (Join-Path $root 'hook\out\SAS.dll')
@@ -134,6 +136,20 @@ $lines.Add("hide-stop-service = 'Y'")
 $tomlText = ($lines -join "`r`n") + "`r`n"
 [System.IO.File]::WriteAllText((Join-Path $cfgDir 'RustDesk2.toml'), $tomlText, (New-Object System.Text.UTF8Encoding($false)))
 
+# ---------------- 3.5 固定密码（可选） ----------------
+# 写在 RustDesk.toml 的 password 字段。RustDesk 支持明文存储（校验时直接比对，
+# 见 hbb_common::config::permanent_password::local_permanent_password_storage_matches_plain），
+# 客户端后续会按自己的规则（机器 UUID 派生的密钥）把它加密成 "01..." 存储。
+$pwdFile = Join-Path $cfgDir 'RustDesk.toml'
+if ($Password) {
+  if ($Password.Contains("'")) { throw "Password 不能包含单引号（会破坏 TOML 字面量）" }
+  $pwdText = "password = '$Password'`r`n"
+  [System.IO.File]::WriteAllText($pwdFile, $pwdText, (New-Object System.Text.UTF8Encoding($false)))
+  Write-Host "    已内置固定密码 -> RustDesk.toml" -ForegroundColor DarkGray
+} elseif (Test-Path $pwdFile) {
+  Remove-Item $pwdFile -Force    # 不带密码时清掉上一次构建的残留
+}
+
 # ---------------- 4. 编译 ----------------
 if ($SkipCompile) { Write-Host "[4/4] 已跳过编译" -ForegroundColor Yellow; return }
 
@@ -209,6 +225,7 @@ $defs = @(
 if (-not $AppImage) { $AppImage = $AppExeRel }
 $defs += "/DAPP_IMAGE=$AppImage"
 if ($iconOk) { $defs += "/DAPP_ICON=$iconPath" }
+if ($Password) { $defs += '/DHAS_PW' }
 
 & $NsisExe @defs $nsiPath
 if ($LASTEXITCODE -ne 0) { throw "makensis 编译失败，退出码 $LASTEXITCODE" }
