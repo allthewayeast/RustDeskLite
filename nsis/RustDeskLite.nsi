@@ -3,12 +3,12 @@
 ;  ---------------------------------------------------------------------------
 ;  目录结构（平铺，无 app 子目录）：
 ;    %TEMP%\RustDesk\
-;        rustdesk.exe  *.dll  data\           ← 官方文件
+;        rustdesk.exe  *.dll  data\          ← 官方文件
 ;        SAS.dll                             ← 劫持壳（把 %APPDATA%\RustDesk 重定向到这里）
 ;        portable                            ← 通知壳：启用便携模式
 ;        config\RustDesk2.toml               ← 内置 ID 服务器 / Key
 ;        config\RustDesk.toml                ← 可选的固定密码
-;        config\、log\、peers\ ...            ← 运行时生成，退出即删
+;        config\、log\、peers\ ...           ← 运行时生成，退出即删
 ;
 ;  流程：清理旧残留 → 解压 → 写标记与配置 → 记录并停止已装 RustDesk
 ;        → 启动→ 等待退出 → 结束进程 → 删目录 → 恢复服务/托盘

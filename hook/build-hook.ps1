@@ -84,4 +84,4 @@ if ($LASTEXITCODE -ne 0) { throw "编译失败（退出码 $LASTEXITCODE）" }
 if (-not (Test-Path $dll)) { throw "未生成 $dll" }
 
 Write-Host ("完成: {0}  ({1:N1} KB)" -f $dll, ((Get-Item $dll).Length / 1KB)) -ForegroundColor Green
-Write-Host "自测：把 SAS.dll 放在 rustdesk.exe 同目录，同目录建一个名为 portable 的空文件，运行后配置应出现在 <该目录>\appdata\RustDesk\config" -ForegroundColor Cyan
+Write-Host "自测：把 SAS.dll 放在 rustdesk.exe 同目录，同目录建一个名为 portable 的空文件，运行后配置应出现在 <该目录>\config" -ForegroundColor Cyan

@@ -49,6 +49,7 @@ static PFN_TrackPopupMenuEx g_realTrackPopupMenuEx = NULL;
 static HMODULE g_realSas = NULL;
 static PFN_SendSAS g_realSendSAS = NULL;
 static WCHAR g_roamingDir[MAX_PATH * 2] = {0};
+static WCHAR g_exeDir[MAX_PATH] = {0};
 static BOOL g_enabled = FALSE;
 static BOOL g_inited = FALSE;
 static BOOL g_trayMode = FALSE;
@@ -232,6 +233,63 @@ static BOOL WINAPI Hook_TrackPopupMenuEx(HMENU menu, UINT flags, int x, int y, H
     return g_realTrackPopupMenuEx(menu, flags, x, y, hwnd, params);
 }
 
+// ---------------------------------------------------------------- 隐藏"未安装版本"提示
+// 首页那张红色提示卡的显示条件是 (Windows && !isDisableInstallation() && !isInstalled())，
+// 见 flutter/lib/desktop/pages/desktop_home_page.dart:461。
+// isDisableInstallation() 对应 librustdesk.dll 的导出函数（Dart 侧按名查找），
+// 这里直接让它恒返回 1，卡片就不显示了；Rust 内部对 is_installed() 的判断不受影响，
+// 便携行为（不起服务、不写 Program Files）保持不变。
+static int WINAPI Hook_DisableInstallation(void) { return 1; }
+
+static BOOL g_lateHooksDone = FALSE;
+
+static BOOL PatchReturnTrue(LPVOID target) {
+    // 兜底：MinHook 挂不上（函数太短）时直接改机器码 mov eax,1; ret
+    DWORD old = 0;
+    if (!VirtualProtect(target, 6, PAGE_EXECUTE_READWRITE, &old)) return FALSE;
+    unsigned char code[6] = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3};
+    memcpy(target, code, sizeof(code));
+    VirtualProtect(target, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), target, 6);
+    return TRUE;
+}
+
+static void EnsureLateHooks(void) {
+    if (g_lateHooksDone) return;
+    g_lateHooksDone = TRUE;
+
+    // 逃生门：程序目录放一个名为 show-install-tip 的文件，就保留上游的安装提示
+    if (g_exeDir[0]) {
+        WCHAR opt[MAX_PATH + 24];
+        lstrcpynW(opt, g_exeDir, MAX_PATH + 24);
+        lstrcatW(opt, L"\\show-install-tip");
+        if (GetFileAttributesW(opt) != INVALID_FILE_ATTRIBUTES) {
+            LogA("show-install-tip marker present, keep install tip");
+            return;
+        }
+    }
+
+    HMODULE lib = GetModuleHandleW(L"librustdesk.dll");
+    if (!lib) { LogA("librustdesk.dll not loaded, skip install-tip hook"); return; }
+
+    const char *names[] = {"wire_is_disable_installation", "rustdesk_is_disable_installation"};
+    BOOL any = FALSE;
+    for (int i = 0; i < 2; i++) {
+        LPVOID p = (LPVOID)GetProcAddress(lib, names[i]);
+        if (!p) { LogA("export %s not found", names[i]); continue; }
+        MH_STATUS st = MH_CreateHook(p, &Hook_DisableInstallation, NULL);
+        if (st == MH_OK) {
+            any = TRUE;
+            LogA("hook %s ok", names[i]);
+        } else {
+            LogA("hook %s failed (%d), patching bytes", names[i], (int)st);
+            if (PatchReturnTrue(p)) any = TRUE;
+        }
+    }
+    if (any) MH_EnableHook(MH_ALL_HOOKS);   // 让新加的钩子生效
+    LogA("install-tip hook done (%d)", (int)any);
+}
+
 // ---------------------------------------------------------------- 钩子本体
 static HRESULT WINAPI Hook_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags,
                                                 HANDLE hToken, PWSTR *ppszPath) {
@@ -251,7 +309,8 @@ static HRESULT WINAPI Hook_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwF
         *ppszPath = copy;
         CreateDirectoryW(g_roamingDir, NULL);   // 调用方通常期望目录已存在
 
-        // 第一次被调用说明已离开 DllMain 的加载器锁，可以安全地起线程
+        // 第一次被调用说明已离开 DllMain 的加载器锁，可以安全地装第二批钩子/起线程
+        EnsureLateHooks();
         if (InterlockedCompareExchange(&g_showStarted, 1, 0) == 0) {
             HANDLE t = CreateThread(NULL, 0, ShowWindowThread, NULL, 0, NULL);
             if (t) CloseHandle(t);
@@ -273,6 +332,7 @@ static void EnsureInit(void) {
     lstrcatW(marker, L"\\portable");
     if (GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES) { LogA("no portable marker, skip"); return; }
 
+    lstrcpynW(g_exeDir, exeDir, MAX_PATH);
     BuildRoamingDir(exeDir, g_roamingDir, MAX_PATH * 2);
     CreateDirectoryW(g_roamingDir, NULL);
     g_enabled = TRUE;

@@ -69,11 +69,21 @@ RustDesk 的配置目录由 `hbb_common::config::Config::path()` 决定，Window
 > `version.dll` 劫持不可行（RustDesk 根本不导入它）；
 > 改名 / junction / 备份还原 `%APPDATA%` 不可行（一旦新进程被强杀，用户原本的 RustDesk 就会启动异常）。
 
-### 2.2 固定密码与托盘「退出」
+### 2.2 固定密码、托盘「退出」与去除安装提示
 
 - **固定密码**：`RustDesk.toml` 的 `password` 字段支持明文（校验走 `local_permanent_password_storage_matches_plain`，
   直接比对），所以构建时把 `-Password` 原样写进去即可；客户端下次保存配置时会用「机器 UUID 派生的密钥」
   自动转成 `01...` 密文。也正因为密钥与目标机器绑定，**无法在构建机上预先生成密文**。
+- **去除「未安装版本」提示**：首页那张红卡的条件是 `Windows && !isDisableInstallation() && !isInstalled()`
+  （`desktop_home_page.dart:461`）。Hook 直接把 `librustdesk.dll` 的导出
+  `wire_is_disable_installation` / `rustdesk_is_disable_installation` 改成恒返回 1，
+  卡片就不再出现；Rust 内部对 `is_installed()` 的判断不受影响，便携行为不变。
+  想保留提示：在程序目录放一个名为 `show-install-tip` 的空文件即可。
+- **去除「未安装版本」提示**：首页那张红卡的条件是 `Windows && !isDisableInstallation() && !isInstalled()`
+  （`desktop_home_page.dart:461`）。Hook 直接把 `librustdesk.dll` 的导出
+  `wire_is_disable_installation` / `rustdesk_is_disable_installation` 改成恒返回 1，
+  卡片就不再出现；Rust 内部对 `is_installed()` 的判断不受影响，便携行为不变。
+  想保留提示：在程序目录放一个名为 `show-install-tip` 的空文件即可。
 - **托盘「退出」**：托盘进程（`--tray`）的菜单由 `tray-icon` 库通过 `TrackPopupMenu` 弹出。
   Hook 只在带 `--tray` 的进程里挂 `TrackPopupMenu` / `TrackPopupMenuEx`，命中类名为 `tray_icon_app`
   的窗口时给菜单追加一项「退出 RustDesk」，并 subclass 该窗口的 `WndProc` 截获这个菜单 id，
