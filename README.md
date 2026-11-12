@@ -69,7 +69,7 @@ RustDesk 的配置目录由 `hbb_common::config::Config::path()` 决定，Window
 > `version.dll` 劫持不可行（RustDesk 根本不导入它）；
 > 改名 / junction / 备份还原 `%APPDATA%` 不可行（一旦新进程被强杀，用户原本的 RustDesk 就会启动异常）。
 
-### 2.2 固定密码、托盘「退出」与去除安装提示
+### 2.2 固定密码、托盘「退出」、去除安装提示与抑制 UAC 探测
 
 - **固定密码**：`RustDesk.toml` 的 `password` 字段支持明文（校验走 `local_permanent_password_storage_matches_plain`，
   直接比对），所以构建时把 `-Password` 原样写进去即可；客户端下次保存配置时会用「机器 UUID 派生的密钥」
@@ -84,6 +84,12 @@ RustDesk 的配置目录由 `hbb_common::config::Config::path()` 决定，Window
   `wire_is_disable_installation` / `rustdesk_is_disable_installation` 改成恒返回 1，
   卡片就不再出现；Rust 内部对 `is_installed()` 的判断不受影响，便携行为不变。
   想保留提示：在程序目录放一个名为 `show-install-tip` 的空文件即可。
+- **抑制 UAC 探测风暴**：RustDesk 在"未安装"模式下，采集循环**每帧**都会执行一次
+  `tasklist | findstr consent.exe` 来探测 UAC 安全桌面（`video_service.rs:750` →
+  `is_process_consent_running()`），也就是每帧拉起 cmd + tasklist + findstr 三个进程。
+  Hook 在 `CreateProcessW` 里把这条命令换成自带的 2.5 KB 空程序 `rdnop.exe`：
+  进程数从 3 降到 1，返回结果同样是"没有 consent.exe"。
+  代价：真实 UAC 弹窗的探测会失效——便携模式本来也抓不到安全桌面，影响可忽略。
 - **托盘「退出」**：托盘进程（`--tray`）的菜单由 `tray-icon` 库通过 `TrackPopupMenu` 弹出。
   Hook 只在带 `--tray` 的进程里挂 `TrackPopupMenu` / `TrackPopupMenuEx`，命中类名为 `tray_icon_app`
   的窗口时给菜单追加一项「退出 RustDesk」，并 subclass 该窗口的 `WndProc` 截获这个菜单 id，

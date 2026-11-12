@@ -124,6 +124,15 @@ if (-not (Test-Path $HookDll)) {
 Copy-Item $HookDll (Join-Path $appDir 'SAS.dll') -Force
 Write-Host ("    劫持壳已注入: SAS.dll ({0:N1} KB)" -f ((Get-Item $HookDll).Length / 1KB)) -ForegroundColor DarkGray
 
+# no-op 小程序：Hook 用它顶替 RustDesk 每帧执行的 tasklist | findstr
+$nopSrc = Join-Path (Split-Path $HookDll -Parent) 'rdnop.exe'
+if (Test-Path $nopSrc) {
+  Copy-Item $nopSrc (Join-Path $appDir 'rdnop.exe') -Force
+  Write-Host ("    no-op 程序: rdnop.exe ({0:N1} KB)" -f ((Get-Item $nopSrc).Length / 1KB)) -ForegroundColor DarkGray
+} else {
+  Write-Host "    未找到 rdnop.exe，UAC 探测仍会启动 tasklist（可运行 hook\build-hook.ps1 生成）" -ForegroundColor DarkYellow
+}
+
 # ---------------- 3. 生成内置服务器配置 ----------------
 Write-Host "[3/4] 生成配置 (ID服务器=$IdServer) ..." -ForegroundColor Cyan
 $lines = New-Object System.Collections.Generic.List[string]

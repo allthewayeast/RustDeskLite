@@ -37,6 +37,9 @@ typedef HRESULT(WINAPI *PFN_SHGetKnownFolderPath)(REFKNOWNFOLDERID, DWORD, HANDL
 typedef BOOL(WINAPI *PFN_SendSAS)(BOOL);
 typedef BOOL(WINAPI *PFN_TrackPopupMenu)(HMENU, UINT, int, int, int, HWND, const RECT *);
 typedef BOOL(WINAPI *PFN_TrackPopupMenuEx)(HMENU, UINT, int, int, HWND, const LPTPMPARAMS);
+typedef BOOL(WINAPI *PFN_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
+                                        BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW,
+                                        LPPROCESS_INFORMATION);
 
 // 自备 GUID 常量，避免不同工具链 knownfolders.h / uuid 库的差异
 static const GUID kRoamingAppData = {
@@ -46,6 +49,8 @@ static const GUID kRoamingAppData = {
 static PFN_SHGetKnownFolderPath g_realSHGetKnownFolderPath = NULL;
 static PFN_TrackPopupMenu g_realTrackPopupMenu = NULL;
 static PFN_TrackPopupMenuEx g_realTrackPopupMenuEx = NULL;
+static PFN_CreateProcessW g_realCreateProcessW = NULL;
+static WCHAR g_nopPath[MAX_PATH + 16] = {0};
 static HMODULE g_realSas = NULL;
 static PFN_SendSAS g_realSendSAS = NULL;
 static WCHAR g_roamingDir[MAX_PATH * 2] = {0};
@@ -290,6 +295,25 @@ static void EnsureLateHooks(void) {
     LogA("install-tip hook done (%d)", (int)any);
 }
 
+// ---------------------------------------------------------------- 抑制 UAC 探测风暴
+// RustDesk 在“未安装”模式下，采集循环每帧都会执行
+//     cmd /C tasklist | findstr consent.exe
+// 来探测 UAC 安全桌面（src/server/video_service.rs:750 → is_process_consent_running()）。
+// 这里把它换成自带的 2.5 KB 空程序：不再拉起 cmd / tasklist / findstr 三个进程，
+// 输出的仍是“没有 consent.exe”，与便携模式（没有服务、本来就抓不到安全桌面）一致。
+static BOOL WINAPI Hook_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUTES pa,
+                                       LPSECURITY_ATTRIBUTES ta, BOOL inherit, DWORD flags,
+                                       LPVOID env, LPCWSTR cwd, LPSTARTUPINFOW si,
+                                       LPPROCESS_INFORMATION pi) {
+    if (g_nopPath[0] && cmd && wcsstr(cmd, L"findstr consent.exe")) {
+        WCHAR line[MAX_PATH + 16];
+        wsprintfW(line, L"\"%s\"", g_nopPath);
+        return g_realCreateProcessW(NULL, line, pa, ta, inherit, flags | CREATE_NO_WINDOW,
+                                    env, cwd, si, pi);
+    }
+    return g_realCreateProcessW(app, cmd, pa, ta, inherit, flags, env, cwd, si, pi);
+}
+
 // ---------------------------------------------------------------- 钩子本体
 static HRESULT WINAPI Hook_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags,
                                                 HANDLE hToken, PWSTR *ppszPath) {
@@ -342,6 +366,11 @@ static void EnsureInit(void) {
     const WCHAR *cmdline = GetCommandLineW();
     g_trayMode = (cmdline && wcsstr(cmdline, L"--tray") != NULL);
 
+    // 自带的空程序（替代每帧的 tasklist | findstr）
+    lstrcpynW(g_nopPath, exeDir, MAX_PATH + 16);
+    lstrcatW(g_nopPath, L"\\rdnop.exe");
+    if (GetFileAttributesW(g_nopPath) == INVALID_FILE_ATTRIBUTES) g_nopPath[0] = 0;
+
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK) { LogA("MH_Initialize failed %d", (int)st); g_enabled = FALSE; return; }
 
@@ -349,6 +378,12 @@ static void EnsureInit(void) {
                           &Hook_SHGetKnownFolderPath,
                           (LPVOID *)&g_realSHGetKnownFolderPath);
     if (st != MH_OK) { LogA("hook SHGetKnownFolderPath failed %d", (int)st); MH_Uninitialize(); g_enabled = FALSE; return; }
+
+    if (g_nopPath[0]) {
+        st = MH_CreateHookApi(L"kernel32.dll", "CreateProcessW",
+                              &Hook_CreateProcessW, (LPVOID *)&g_realCreateProcessW);
+        LogA("hook CreateProcessW: %d (nop=%ls)", (int)st, g_nopPath);
+    }
 
     if (g_trayMode) {
         st = MH_CreateHookApi(L"user32.dll", "TrackPopupMenu",

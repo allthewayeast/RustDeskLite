@@ -84,4 +84,13 @@ if ($LASTEXITCODE -ne 0) { throw "编译失败（退出码 $LASTEXITCODE）" }
 if (-not (Test-Path $dll)) { throw "未生成 $dll" }
 
 Write-Host ("完成: {0}  ({1:N1} KB)" -f $dll, ((Get-Item $dll).Length / 1KB)) -ForegroundColor Green
+
+# ---------- 6. 编译 no-op 小程序（替代每帧执行的 tasklist | findstr） ----------
+$nop = Join-Path $OutDir 'rdnop.exe'
+& $cl /nologo /utf-8 /c /O1 /GS- (Join-Path $here 'nop.c') "/Fo$OutDir\" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "rdnop.exe 编译失败" }
+$link = Join-Path (Split-Path $cl -Parent) 'link.exe'
+& $link /nologo /SUBSYSTEM:WINDOWS /ENTRY:nopEntry /NODEFAULTLIB "$OutDir\nop.obj" kernel32.lib "/OUT:$nop" | Out-Null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $nop)) { throw "rdnop.exe 链接失败" }
+Write-Host ("完成: {0}  ({1:N1} KB)" -f $nop, ((Get-Item $nop).Length / 1KB)) -ForegroundColor Green
 Write-Host "自测：把 SAS.dll 放在 rustdesk.exe 同目录，同目录建一个名为 portable 的空文件，运行后配置应出现在 <该目录>\config" -ForegroundColor Cyan
