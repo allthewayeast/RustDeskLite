@@ -6,7 +6,8 @@
 //       —— Roaming 返回 <exe目录的父目录>，RustDesk 自己拼上 "RustDesk"，
 //          结果正好落在 <exe目录>\config 等位置（平铺，无 appdata 子层）。
 //    2) 主进程启动后把主窗口显示出来并置前（即使被 SW_HIDE 启动）。
-//    3) 托盘进程里给右键菜单追加「退出 RustDesk」，点击即关闭主程序。
+//    3) 托盘进程里改写右键菜单：去掉「停止服务」（它会 sc delete 掉正式版的服务），
+//       补一个「退出 RustDesk」（点击即关闭主程序）。
 //
 //  手段：
 //    - librustdesk.dll 静态导入 SAS.dll（系统里只有 1 个导出 SendSAS），
@@ -58,13 +59,16 @@ static WCHAR g_exeDir[MAX_PATH] = {0};
 static BOOL g_enabled = FALSE;
 static BOOL g_inited = FALSE;
 static BOOL g_trayMode = FALSE;
+static BOOL g_cmMode = FALSE;      // 本进程是被控端拉起的连接管理窗口（--cm）
 static WNDPROC g_trayOldProc = NULL;
 static HWND g_trayHwnd = NULL;
 static LONG g_showStarted = 0;
 static BOOL g_tipHooksDone = FALSE;
 
-// 托盘的「退出」菜单项 id（不会被 RustDesk 自身的 id 表命中）
-#define TRAY_EXIT_ID 0x5244
+// 托盘的「退出」菜单项 id。
+// muda（RustDesk 用的菜单库）的 internal_id 是从 1 开始自增的小整数，
+// 这里取 0x7F00 既不会撞上，又能安全落在 16 位内（个别系统会截断命令 id）。
+#define TRAY_EXIT_ID 0x7F00
 
 static void LogA(const char *fmt, ...) {
     char path[MAX_PATH] = {0};
@@ -160,13 +164,195 @@ static void ForceShow(HWND hwnd) {
     }
 }
 
-// 主进程启动后被 SW_HIDE 启动（nsExec 等）时，把窗口显示出来
+// ---------------------------------------------------------------- 关闭即隐藏
+// 正式版点右上角 ✕ 只是隐藏窗口，进程留在托盘；便携版没有服务，
+// Dart 侧的 windowManager.setPreventClose(true)（main.dart:112，未 await）
+// 在初始化竞态下可能没生效，于是 WM_CLOSE 落到 DefWindowProc -> DestroyWindow
+// -> WM_DESTROY -> PostQuitMessage(0)（runner/main.cpp:185 设了 quit_on_close=true），
+// 进程直接退出。实测：不带服务时 SC_CLOSE 会让进程立刻消失。
+//
+// 这里在主窗口上拦 WM_CLOSE，改为 SW_HIDE，与正式版行为对齐。
+// 恢复窗口靠托盘「打开」（再启一个实例，单实例逻辑会 ShowWindow 已有窗口）。
+static WNDPROC g_mainOldProc = NULL;
+static HWND g_mainHwnd = NULL;
+
+// 托盘点「退出」时发给主窗口的自定义消息。
+//
+// 为什么不用 PostThreadMessageW(tid, WM_QUIT)：跨进程投递线程消息要求目标线程的
+// 消息队列句柄（由 PostThreadMessage 在对方线程首次调 user32 时自动创建，外部拿不到），
+// 实测直接返回 FALSE，线程收不到 —— 托盘的「退出」会变成死按钮。
+// 走窗口消息没有这个问题：窗口句柄跨进程有效，消息在目标线程的消息泵里被取出。
+//
+// 为什么不直接 PostQuitMessage：实测目标线程调了 PostQuitMessage 后进程依然存活。
+// Flutter 运行时不止一个消息泵（原生 runner 与平台线程各跑各的），只退出其中一个
+// 留不住上下文。这里改为「置退出标志 + 放行 WM_CLOSE」，
+// 走原生那条最可靠的链：DefWindowProc -> DestroyWindow -> WM_DESTROY
+// -> PostQuitMessage(0)（runner/main.cpp:185 设了 quit_on_close=true）。
+#define WM_RDLITE_QUIT (WM_APP + 0x51)
+
+static BOOL g_reallyClosing = FALSE;
+static BOOL g_endSession = FALSE;     // 系统正在关机/注销
+
+static LRESULT CALLBACK MainSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // 关机 / 注销：必须放行，否则窗口拦着不让关，系统会弹「此程序阻止关机」。
+    // WM_QUERYENDSESSION 是系统在关机前问「能不能结束」，这里直接回 TRUE 并放行后续的
+    // WM_CLOSE / WM_ENDSESSION。用户点 ✕ 不会走这条消息，所以不影响「关闭即隐藏」。
+    if (msg == WM_QUERYENDSESSION) {
+        g_endSession = TRUE;
+        LogA("system shutdown/logoff, allowing close");
+        return TRUE;
+    }
+    if (msg == WM_ENDSESSION) {
+        g_endSession = (BOOL)wParam;
+        return CallWindowProcW(g_mainOldProc, hwnd, msg, wParam, lParam);
+    }
+
+    if (msg == WM_CLOSE) {
+        // 托盘「退出」置了标志，或系统正在关机 -> 放行，让窗口真正销毁
+        if (g_reallyClosing || g_endSession) {
+            LogA("main window real close, passing to DefWindowProc");
+            return CallWindowProcW(g_mainOldProc, hwnd, msg, wParam, lParam);
+        }
+        ShowWindow(hwnd, SW_HIDE);
+        LogA("main window hidden on close");
+        return 0;
+    }
+    if (msg == WM_RDLITE_QUIT) {
+        LogA("quit request: flag set, reposting WM_CLOSE");
+        g_reallyClosing = TRUE;
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);   // 再走一遍 WM_CLOSE，这次放行
+        return 0;
+    }
+    return CallWindowProcW(g_mainOldProc, hwnd, msg, wParam, lParam);
+}
+
+static void InstallMainCloseHook(HWND hwnd) {
+    if (!hwnd) return;
+    if (g_mainHwnd && IsWindow(g_mainHwnd)) return;   // 已经装过且窗口还在
+    g_mainHwnd = hwnd;
+    g_mainOldProc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)MainSubclassProc);
+    LogA("main window subclassed for close-to-hide");
+}
+
+// ---------------------------------------------------------------- 隐藏连接管理窗口
+// 被控端收到连接时，server/connection.rs:6412 的 start_ipc() 会拉起一个 `--cm` 进程
+// （连接管理窗口 / Connection Manager）。它运行在独立进程、独立 HWND 上，
+// 屏幕右上角、固定 300x490（consts.dart:355 kConnectionManagerWindowSizeClosedChat）。
+//
+// 上游本来就有隐藏开关，但三道门都过不去：
+//   1. libs/hbb_common/password_security.rs:88 hide_cm() 需要
+//      approve-mode='password' + verification-method='use-permanent-password' + allow-hide-cm
+//   2. 更要命的是 src/ipc.rs:998：只有 is_pro() || is_custom_client() 才返回该值，
+//      否则直接 None。我们 APP_NAME 是 "RustDesk" -> is_custom_client()=false
+//   3. custom.txt 能改 app-name，但 common.rs:2617 要用官方私钥验签，伪造不了
+//
+// 所以只能在这一层处理。注意不能用一次性 hide：server_model.dart 在多个时机
+// （168/175/284/286/524/526/570）会重新 showCmWindow()，必须持续压制。
+//
+// ---- 两个必须知道的实情（都是读源码 + 实测确认的，别再猜） ----
+//
+// 1) CM 窗口**不是** multi_window 子窗口，它走的是主窗口路径。
+//    main.dart:50 的分支是：args.first == "multi_window" 才走 createWindow 那套
+//    （那是"./DesktopMultiWindow.createWindow()"创建的子窗口，类名 RustdeskMultiWindow，
+//    控制别人时的远程桌面窗口才是它）。`--cm` 进程 args[0] 是 "--cm"，进 else 分支，
+//    走 runMainApp -> 普通主窗口，类名还是 FLUTTER_RUNNER_WIN32_WINDOW。
+//    所以这里沿用 IsMainClassName 是对的。
+//
+// 2) 光 ShowWindow(SW_HIDE) 会在任务栏留下一个图标。
+//    原因是主窗口在 flutter/windows/runner/win32_window.cpp 里用
+//        CreateWindow(..., WS_OVERLAPPEDWINDOW, ...)
+//    创建，是个"正常应用窗口"，任务栏必然出按钮。要摘掉它得改成工具窗口：
+//        ex |= WS_EX_TOOLWINDOW;   // 不进任务栏、不进 Alt+Tab
+//        ex &= ~WS_EX_APPWINDOW;   // 抵掉强制上任务栏的位
+//    两个都要做：WS_EX_APPWINDOW 优先级高于 WS_EX_TOOLWINDOW，只加 TOOLWINDOW 不生效。
+static volatile LONG g_cmStop = 0;
+
+// 把窗口改成"工具窗口"，从任务栏和 Alt+Tab 里摘掉。
+// 返回 TRUE 表示这次确实改了样式。
+static BOOL MakeToolWindow(HWND hwnd) {
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    LONG_PTR want = (ex | WS_EX_TOOLWINDOW) & ~(LONG_PTR)WS_EX_APPWINDOW;
+    if (want == ex) return FALSE;
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
+    // 改扩展样式后任务栏不会自己刷新。此时窗口本来就该是隐藏的，
+    // 这里再 SW_HIDE 一次让它重建按钮；不发 SW_SHOW，避免窗口闪一下。
+    ShowWindow(hwnd, SW_HIDE);
+    return TRUE;
+}
+
+// CM 窗口查找的累加器：记录"最像 CM 窗口"的那个候选。
+// 不用"找到第一个就返回"——Flutter 引擎的 1x1 辅助窗口在枚举顺序里
+// 经常排在前面，必须比较后择优。
+typedef struct {
+    HWND best;
+    int  bestArea;
+} CmSearch;
+
+static BOOL CALLBACK FindCmProc(HWND hwnd, LPARAM lp) {
+    CmSearch *s = (CmSearch *)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    if (!IsMainClassName(hwnd)) return TRUE;
+
+    RECT rc;
+    if (!GetWindowRect(hwnd, &rc)) return TRUE;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+
+    // 最小化状态：rect 是 (-32000,-32000) 起算的"最小化矩形"，
+    // 实测 CM 窗口只有 160x28 —— 不能按尺寸排除，直接视为强候选。
+    // Flutter 的 1x1 辅助窗口从不最小化，所以这个例外很安全。
+    if (IsIconic(hwnd)) {
+        s->best = hwnd;
+        s->bestArea = 0x7FFFFFFF;
+        return FALSE;                      // 最小化的主窗口就是目标，无需再找
+    }
+
+    // 非最小化：按面积择优。1x1 辅助窗口面积只有 1，天然垫底。
+    if (w < 50 || h < 50) {
+        // 可能是辅助窗口；只有在还没有任何候选时才记下，避免误判为空
+        if (s->best == NULL) { s->best = hwnd; s->bestArea = w * h; }
+        return TRUE;
+    }
+    int area = w * h;
+    if (area > s->bestArea) { s->best = hwnd; s->bestArea = area; }
+    return TRUE;
+}
+
+static DWORD WINAPI HideCmWindowThread(LPVOID unused) {
+    (void)unused;
+    HWND last = NULL;
+    for (int i = 0; i < 36000 && !g_cmStop; i++) {   // 最长约 60 分钟，随进程一起结束
+        CmSearch s;
+        s.best = NULL;
+        s.bestArea = -1;
+        EnumWindows(FindCmProc, (LPARAM)&s);
+        HWND h = s.best;
+        if (h) {
+            if (h != last) {
+                LogA("cm window found, suppressing %p", (void *)h);
+                last = h;
+            }
+            // 先摘任务栏按钮，再隐藏。MakeToolWindow 内部判断是否真需要改，
+            // 改过就不再重复 SetWindowLongPtr（否则每 100ms 都调一次）。
+            if (MakeToolWindow(h)) LogA("cm window ex-style -> TOOLWINDOW (removed from taskbar)");
+            if (IsWindowVisible(h)) ShowWindow(h, SW_HIDE);
+        }
+        Sleep(100);
+    }
+    return 0;
+}
+
+// 主进程启动后被 SW_HIDE 启动（nsExec 等）时，把窗口显示出来。
+// 注意：`--cm` 进程不走这里 —— 那是连接管理窗口，要隐藏而不是显示，
+// 由 HideCmWindowThread 负责。
 static DWORD WINAPI ShowWindowThread(LPVOID unused) {
     (void)unused;
     for (int i = 0; i < 50; i++) {          // 最长约 15 秒
         // 前 6 秒只认有标题的窗口，避免闪出一个还没画完的空白框
         HWND h = FindOwnMainWindow(i < 20);
         if (h) {
+            InstallMainCloseHook(h);        // 关闭时隐藏而不是退出
             ForceShow(h);
             LogA("main window forced visible");
             return 0;
@@ -178,22 +364,23 @@ static DWORD WINAPI ShowWindowThread(LPVOID unused) {
 }
 
 // ---------------------------------------------------------------- 托盘退出
-static BOOL CALLBACK QuitMainProc(HWND hwnd, LPARAM lp) {
+// 主窗口被我们子类化过（见 MainSubclassProc），WM_CLOSE 已被改成 hide，
+// 所以这里不能再用 WM_CLOSE 收尾 —— 改为投递 WM_RDLITE_QUIT，
+// 由主进程在自己的线程里 PostQuitMessage，退出消息循环。
+static BOOL CALLBACK QuitHardProc(HWND hwnd, LPARAM lp) {
     int *posted = (int *)lp;
     if (!IsMainClassName(hwnd)) return TRUE;
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    if (pid != GetCurrentProcessId()) {      // 托盘进程里没有主窗口，目标在别的进程
-        PostMessageW(hwnd, WM_CLOSE, 0, 0);
-        (*posted)++;
-    }
+    if (pid == GetCurrentProcessId()) return TRUE;   // 只发给别的进程（主进程）
+    if (PostMessageW(hwnd, WM_RDLITE_QUIT, 0, 0)) (*posted)++;
     return TRUE;
 }
 
 static void QuitMainApp(void) {
     int posted = 0;
-    EnumWindows(QuitMainProc, (LPARAM)&posted);
-    LogA("tray exit: WM_CLOSE posted to %d window(s)", posted);
+    EnumWindows(QuitHardProc, (LPARAM)&posted);
+    LogA("tray exit: WM_RDLITE_QUIT posted to %d window(s)", posted);
 }
 
 static LRESULT CALLBACK TraySubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -227,16 +414,62 @@ static void PrepareTrayMenu(HWND hwnd, HMENU menu) {
     LogA("tray menu item appended");
 }
 
+// ---------------------------------------------------------------- 托盘菜单：去「停止服务」
+// muda 0.17.1 在 Windows 上弹菜单固定带 TPM_RETURNCMD（muda platform_impl/windows:
+// show_context_menu），选中项通过 **返回值** 交给 menu_selected，不会向窗口发
+// WM_COMMAND —— 所以 TraySubclassProc 里的 WM_COMMAND 分支根本收不到点击，
+// 「退出 RustDesk」必须在 TrackPopupMenu 返回之后自己判断返回值。
+//
+// 移除「停止服务」用位置判据，不用文案：tray.rs 里固定是
+//     append_items(&[&open_i, quit_i])       // quit_i 就是「停止服务」
+// 即菜单原始内容恒为 [打开] 或 [打开, 停止服务]（后者在 hide-stop-service=Y 时不存在）。
+// 文案随语言变、ja/hi 两个语言包里该 key 甚至是空串，靠文本匹配不可靠。
+
+// 数出原始项数（Hook 动手之前的项数）。
+// PrepareTrayMenu 若加过，必定在**末尾**追加了一对「分隔线 + 退出」，
+// 所以直接减 2 即可 —— 不靠 GetMenuItemID 判断分隔线
+// （实测它对本进程 AppendMenuW 加的分隔线返回 0，不是文档说的 -1，不能用来识别）。
+static int CountOriginalItems(HMENU menu) {
+    int n = GetMenuItemCount(menu);
+    if (n >= 2 && GetMenuItemID(menu, n - 1) == TRAY_EXIT_ID) return n - 2;
+    return n;
+}
+
+// 原始项恰好是 [打开, 停止服务] 时摘掉后者。多于 2 项说明结构变了（未来版本），
+// 宁可不动也不猜错位置删掉别人的菜单项。
+static void RemoveStopServiceItem(HMENU menu) {
+    int orig = CountOriginalItems(menu);
+    if (orig != 2) {
+        if (orig > 2) LogA("tray menu has %d items, skip stop-service removal", orig);
+        return;
+    }
+    if (DeleteMenu(menu, 1, MF_BYPOSITION)) LogA("tray menu: stop-service removed");
+}
+
+// 统一处理 TrackPopupMenu / TrackPopupMenuEx 的返回值。
+// 带 TPM_RETURNCMD 时返回值就是选中项 id（muda 正是这么用的），要自己消化：
+// 命中我们的「退出」就关主程序，并且返回 0 让 muda 的 find_by_id 落空、不产生事件。
+static int HandleMenuResult(UINT flags, int ret) {
+    if (!(flags & TPM_RETURNCMD)) return ret;
+    if (ret > 0 && (UINT)ret == TRAY_EXIT_ID) {
+        QuitMainApp();
+        return 0;
+    }
+    return ret;
+}
+
 static BOOL WINAPI Hook_TrackPopupMenu(HMENU menu, UINT flags, int x, int y, int reserved,
                                        HWND hwnd, const RECT *rc) {
     PrepareTrayMenu(hwnd, menu);
-    return g_realTrackPopupMenu(menu, flags, x, y, reserved, hwnd, rc);
+    RemoveStopServiceItem(menu);
+    return HandleMenuResult(flags, g_realTrackPopupMenu(menu, flags, x, y, reserved, hwnd, rc));
 }
 
 static BOOL WINAPI Hook_TrackPopupMenuEx(HMENU menu, UINT flags, int x, int y, HWND hwnd,
                                          const LPTPMPARAMS params) {
     PrepareTrayMenu(hwnd, menu);
-    return g_realTrackPopupMenuEx(menu, flags, x, y, hwnd, params);
+    RemoveStopServiceItem(menu);
+    return HandleMenuResult(flags, g_realTrackPopupMenuEx(menu, flags, x, y, hwnd, params));
 }
 
 // ---------------------------------------------------------------- 隐藏"未安装版本"提示
@@ -357,7 +590,9 @@ static HRESULT WINAPI Hook_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwF
         // 第一次被调用说明已离开 DllMain 的加载器锁，可以安全地装第二批钩子/起线程
         EnsureTipHooks();
         if (InterlockedCompareExchange(&g_showStarted, 1, 0) == 0) {
-            HANDLE t = CreateThread(NULL, 0, ShowWindowThread, NULL, 0, NULL);
+            // --cm 进程：连接管理窗口只隐藏、不显示
+            HANDLE t = CreateThread(NULL, 0, g_cmMode ? HideCmWindowThread : ShowWindowThread,
+                                    NULL, 0, NULL);
             if (t) CloseHandle(t);
         }
     }
@@ -386,6 +621,7 @@ static void EnsureInit(void) {
     // 托盘进程才需要菜单钩子
     const WCHAR *cmdline = GetCommandLineW();
     g_trayMode = (cmdline && wcsstr(cmdline, L"--tray") != NULL);
+    g_cmMode = (cmdline && wcsstr(cmdline, L"--cm") != NULL);
 
     // 自带的空程序（替代每帧的 tasklist | findstr）
     lstrcpynW(g_nopPath, exeDir, MAX_PATH + 16);

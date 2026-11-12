@@ -266,6 +266,10 @@ Section "main"
 !ifdef HAS_PW
   File "${PAYLOAD_DIR}\cfg\RustDesk.toml"
 !endif
+; RustDesk_local.toml 对应 LocalConfig（另一份独立配置），有才打进去
+!ifdef HAS_LOCAL_CFG
+  File "${PAYLOAD_DIR}\cfg\RustDesk_local.toml"
+!endif
 
 
   ; ---- 4. 记录并停止本机已有的 RustDesk（配置文件一律不碰） ----

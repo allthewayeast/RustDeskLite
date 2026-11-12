@@ -2,7 +2,8 @@
 <#
   RustDesk Lite 构建脚本
   1) 把 C:\Program Files\RustDesk 复制成 payload\app 并做精简
-  2) 生成内置 ID 服务器 / Key 的 config（payload\cfg\RustDesk2.toml）
+  2) 生成内置 ID 服务器 / Key 的 config（payload\cfg\RustDesk2.toml），
+     以及本机设置 payload\cfg\RustDesk_local.toml（默认关闭更新检查）
   3) 调用 makensis 打成单文件 exe（LZMA 固实压缩）
 
   用法示例：
@@ -28,7 +29,8 @@ param(
   [int]$TrialDays = -1,
   [switch]$ReusePayload,
   [switch]$SkipCompile,
-  [switch]$NoIcon
+  [switch]$NoIcon,
+  [switch]$CheckUpdate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,6 +69,12 @@ $HookDll    = Pick 'HookDll'    (Join-Path $root 'hook\out\SAS.dll')
 if ($TrialDays -lt 0) {
   if ($cfg.ContainsKey('TrialDays') -and "$($cfg['TrialDays'])" -ne '') { $TrialDays = [int]$cfg['TrialDays'] }
   else { $TrialDays = 30 }
+}
+
+# 更新检查：默认关闭；命令行 -CheckUpdate 或 settings 里 CheckUpdate = $true 才保留
+$checkUpdateEnabled = $CheckUpdate.IsPresent
+if (-not $checkUpdateEnabled -and $cfg.ContainsKey('CheckUpdate')) {
+  $checkUpdateEnabled = [bool]$cfg['CheckUpdate']
 }
 
 if (-not $IdServer) { throw '未配置 IdServer：请在 settings.local.psd1 里填写（参考 settings.psd1 模板），或传 -IdServer' }
@@ -147,8 +155,10 @@ $lines.Add('[options]')
 $lines.Add("custom-rendezvous-server = '$IdServer'")
 if ($RelayServer) { $lines.Add("relay-server = '$RelayServer'") }
 $lines.Add("key = '$Key'")
-# 便携模式没有服务，隐藏托盘里会失效的“停止服务”菜单项
-$lines.Add("hide-stop-service = 'Y'")
+# 注：这里不要再写 hide-stop-service。它属于 builtin 设置，只有签名过的 custom client
+# 配置（custom.txt -> read_custom_client_advanced_settings -> BUILTIN_SETTINGS）才会填充；
+# 写进 RustDesk2.toml 的 [options] 对 tray.rs 完全不起作用（它走 get_builtin_option）。
+# 托盘里的「停止服务」由 SAS.dll 的菜单钩子在弹出前删掉，见 hook/sas_proxy.c。
 $tomlText = ($lines -join "`r`n") + "`r`n"
 [System.IO.File]::WriteAllText((Join-Path $cfgDir 'RustDesk2.toml'), $tomlText, (New-Object System.Text.UTF8Encoding($false)))
 
@@ -164,6 +174,29 @@ if ($Password) {
   Write-Host "    已内置固定密码 -> RustDesk.toml" -ForegroundColor DarkGray
 } elseif (Test-Path $pwdFile) {
   Remove-Item $pwdFile -Force    # 不带密码时清掉上一次构建的残留
+}
+
+# ---------------- 3.6 本机设置（可选） ----------------
+# 写到 RustDesk_local.toml —— 对应 hbb_common 的 LocalConfig（file_("_local")），
+# 和 RustDesk2.toml（Config::file()，全局配置）是两个独立的文件，别混。
+#
+# 注意选项的归属：不同 key 读的是不同的配置对象，写错文件就静默失效。
+#   enable-check-update -> LocalConfig::get_option（common.rs:1064），即本文件
+#   hide-stop-service   -> get_builtin_option（BUILTIN_SETTINGS），写哪都没用
+# 判断某个 key 该放哪儿，看它被哪个 get_option 读：
+#   Config::get_option      -> RustDesk2.toml
+#   LocalConfig::get_option -> RustDesk_local.toml
+$localLines = New-Object System.Collections.Generic.List[string]
+$localLines.Add('[options]')
+if (-not $checkUpdateEnabled) { $localLines.Add("enable-check-update = 'N'") }
+if ($localLines.Count -gt 1) {
+  $localText = ($localLines -join "`r`n") + "`r`n"
+  [System.IO.File]::WriteAllText((Join-Path $cfgDir 'RustDesk_local.toml'), $localText, (New-Object System.Text.UTF8Encoding($false)))
+  Write-Host "    已写入 RustDesk_local.toml（关闭更新检查）" -ForegroundColor DarkGray
+} else {
+  $localToml = Join-Path $cfgDir 'RustDesk_local.toml'
+  if (Test-Path $localToml) { Remove-Item $localToml -Force }   # 清掉上一次构建的残留
+  Write-Host "    更新检查: 保持默认（开启）" -ForegroundColor DarkGray
 }
 
 # ---------------- 4. 编译 ----------------
@@ -242,6 +275,7 @@ if (-not $AppImage) { $AppImage = $AppExeRel }
 $defs += "/DAPP_IMAGE=$AppImage"
 if ($iconOk) { $defs += "/DAPP_ICON=$iconPath" }
 if ($Password) { $defs += '/DHAS_PW' }
+if (Test-Path (Join-Path $cfgDir 'RustDesk_local.toml')) { $defs += '/DHAS_LOCAL_CFG' }
 $defs += "/DTRIAL_DAYS=$TrialDays"
 
 # 有效期：编译日期与到期日都在这里算好，作为常量写死进 exe。

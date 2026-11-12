@@ -1,8 +1,8 @@
 #Requires -Version 5.1
 <#
-  编译便携化 Hook DLL（SAS.dll）
+  编译便携化 Hook DLL（sas.dll）
   需要：Visual Studio / Build Tools（含 "使用 C++ 的桌面开发"）
-  产物：默认 X:\RustDesk\hook\out\SAS.dll
+  产物：默认 X:\RustDesk\hook\out\sas.dll
 
   说明：不走 vcvars64.bat（它会调用 reg.exe，受限环境容易被拦），
         这里直接探测 MSVC 与 Windows SDK 路径后设置 INCLUDE/LIB/PATH。
@@ -76,7 +76,7 @@ $sources = @(
 foreach ($s in $sources) { if (-not (Test-Path $s)) { throw "缺少源文件: $s" } }
 
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-$dll = Join-Path $OutDir 'SAS.dll'
+$dll = Join-Path $OutDir 'sas.dll'
 Write-Host "编译中 ..." -ForegroundColor Cyan
 
 & $cl /nologo /utf-8 /LD /O2 /MT /W3 "/I$minhookInc" @sources "/Fo$OutDir\" "/Fe:$dll" /link "/DEF:$(Join-Path $here 'sas.def')" /MACHINE:X64
@@ -93,4 +93,4 @@ $link = Join-Path (Split-Path $cl -Parent) 'link.exe'
 & $link /nologo /SUBSYSTEM:WINDOWS /ENTRY:nopEntry /NODEFAULTLIB "$OutDir\nop.obj" kernel32.lib "/OUT:$nop" | Out-Null
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $nop)) { throw "rdnop.exe 链接失败" }
 Write-Host ("完成: {0}  ({1:N1} KB)" -f $nop, ((Get-Item $nop).Length / 1KB)) -ForegroundColor Green
-Write-Host "自测：把 SAS.dll 放在 rustdesk.exe 同目录，同目录建一个名为 portable 的空文件，运行后配置应出现在 <该目录>\config" -ForegroundColor Cyan
+Write-Host "自测：把 sas.dll 放在 rustdesk.exe 同目录，同目录建一个名为 portable 的空文件，运行后配置应出现在 <该目录>\config" -ForegroundColor Cyan

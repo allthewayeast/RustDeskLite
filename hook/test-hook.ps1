@@ -57,7 +57,7 @@ New-Item -ItemType File -Path (Join-Path $stage 'portable') -Force | Out-Null
 & $cl /nologo /utf-8 /LD /O1 /MT (Join-Path $here 'test_fake_lib.c') "/Fo$stage\" `/Fe:"$stage\librustdesk.dll" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "test_fake_lib 编译失败" }
 
-$probes = @(2, 3)
+$probes = @(2, 3, 6)
 if ($Only.Count -gt 0) { $probes = $Only }
 
 $failed = @()
@@ -84,12 +84,26 @@ foreach ($i in $probes) {
     & $cl /nologo /utf-8 /O1 /MT $src "/Fo$stage\" "/Fe:$exe" /link shell32.lib ole32.lib user32.lib | Out-Null
     if ($LASTEXITCODE -ne 0) { $failed += "probe$i 编译"; continue }
 
+    if ($i -eq 6) { $env:RDLITE_HOOK_LOG = Join-Path $runDir 'hook6.log'; Remove-Item $env:RDLITE_HOOK_LOG -ErrorAction SilentlyContinue }
+
     Write-Host "`n===== probe$i =====" -ForegroundColor Cyan
     Push-Location $runDir
     try {
-        if ($i -eq 5) { & $exe (Join-Path $runDir 'librustdesk.dll') } else { & $exe }
+        if ($i -eq 5) { & $exe (Join-Path $runDir 'librustdesk.dll') }
+        elseif ($i -eq 6) { & $exe --tray }      # 菜单钩子只在 --tray 进程里装
+        else { & $exe }
         if ($LASTEXITCODE -ne 0) { $failed += "probe$i 退出码 $LASTEXITCODE" }
     } finally { Pop-Location }
+
+    if ($i -eq 6) {
+        # probe6 要真弹菜单，日志能证明钩子装上了
+        $log = Join-Path $runDir 'hook6.log'
+        if (Test-Path $log) {
+            Write-Host '--- hook log ---' -ForegroundColor DarkGray
+            Get-Content $log | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+            Remove-Item $log -ErrorAction SilentlyContinue
+        }
+    }
 
     if ($i -eq 5 -and (Test-Path $env:RDLITE_HOOK_LOG)) {
         Write-Host '--- hook log ---' -ForegroundColor DarkGray

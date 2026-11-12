@@ -1,5 +1,11 @@
 # ---- 私密配置（含 ID 服务器地址 / Key，切勿提交）----
 settings.local.psd1
+# SSH 免交互密码助手（明文密码，仅调试机本地使用）
+askpass.bat
+
+# ---- 调试残留 ----
+/.cm-diag.log
+/.cm-test.log
 
 # ---- 构建中间产物 ----
 /payload/

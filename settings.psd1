@@ -23,6 +23,11 @@
     # ---- 固定密码（可选） ----
     Password    = ''                                            # 留空 = 用随机临时密码；填写后写入 RustDesk.toml
 
+    # ---- 更新检查（可选） ----
+    # 默认关闭（写入 RustDesk_local.toml 的 enable-check-update = 'N'）。
+    # 想保留上游的检查更新行为，加 -CheckUpdate 开关即可。
+    CheckUpdate = $false
+
     # ---- 有效期（可选） ----
     # 从编译当天起算的天数，编译时会把「到期日」算好写死进 exe，超过就不再允许运行。
     # 0 或负数 = 不限制。
