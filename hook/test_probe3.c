@@ -22,13 +22,17 @@ int wmain(void) {
 
     WCHAR path[MAX_PATH] = {0};
     DWORD len = MAX_PATH;
+    BOOL replaced = FALSE;
     if (QueryFullProcessImageNameW(pi.hProcess, 0, path, &len)) {
         wprintf(L"image = %s\n", path); fflush(stdout);
+        replaced = (wcsstr(path, L"rdnop.exe") != NULL);
     } else {
         wprintf(L"query failed, err=%lu\n", GetLastError()); fflush(stdout);
     }
     WaitForSingleObject(pi.hProcess, 10000);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return 0;
+
+    wprintf(L"\n%s\n", replaced ? L"PASS" : L"FAIL (expect rdnop.exe)");
+    return replaced ? 0 : 2;
 }

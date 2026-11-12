@@ -49,13 +49,15 @@ if (-not (Test-Path $sas)) { throw "缺少 $sas，先跑 build-hook.ps1" }
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Copy-Item $sas $stage
+$nop = Join-Path $out 'rdnop.exe'
+if (Test-Path $nop) { Copy-Item $nop $stage } else { Write-Host "警告: 缺少 rdnop.exe，probe3 会走原命令" -ForegroundColor Yellow }
 New-Item -ItemType File -Path (Join-Path $stage 'portable') -Force | Out-Null
 
 # 假 librustdesk.dll
 & $cl /nologo /utf-8 /LD /O1 /MT (Join-Path $here 'test_fake_lib.c') "/Fo$stage\" `/Fe:"$stage\librustdesk.dll" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "test_fake_lib 编译失败" }
 
-$probes = @(2)
+$probes = @(2, 3)
 if ($Only.Count -gt 0) { $probes = $Only }
 
 $failed = @()
