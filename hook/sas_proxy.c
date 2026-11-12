@@ -61,6 +61,7 @@ static BOOL g_trayMode = FALSE;
 static WNDPROC g_trayOldProc = NULL;
 static HWND g_trayHwnd = NULL;
 static LONG g_showStarted = 0;
+static BOOL g_tipHooksDone = FALSE;
 
 // 托盘的「退出」菜单项 id（不会被 RustDesk 自身的 id 表命中）
 #define TRAY_EXIT_ID 0x5244
@@ -239,60 +240,80 @@ static BOOL WINAPI Hook_TrackPopupMenuEx(HMENU menu, UINT flags, int x, int y, H
 }
 
 // ---------------------------------------------------------------- 隐藏"未安装版本"提示
-// 首页那张红色提示卡的显示条件是 (Windows && !isDisableInstallation() && !isInstalled())，
+// 首页红卡的条件是 (Windows && !isDisableInstallation() && !isInstalled())，
 // 见 flutter/lib/desktop/pages/desktop_home_page.dart:461。
-// isDisableInstallation() 对应 librustdesk.dll 的导出函数（Dart 侧按名查找），
-// 这里直接让它恒返回 1，卡片就不显示了；Rust 内部对 is_installed() 的判断不受影响，
-// 便携行为（不起服务、不写 Program Files）保持不变。
-static int WINAPI Hook_DisableInstallation(void) { return 1; }
+//
+// Dart 侧的 isDisableInstallation() 走 flutter_rust_bridge 生成的
+//   wire_is_disable_installation() -> *mut DartCObject
+// 注意它返回的是指针（WireSyncReturn = *mut DartCObject），绝对不能直接返回整数。
+// 实测（1.5.1）返回的是一个长度 2 的数组对象：
+//   [0] bool = is_disable_installation() 的结果
+//   [1] bool = 调用是否成功（true）
+// 这里的做法：先调用原函数拿到**由 Rust 正常分配**的对象，只把 [0] 的布尔字节改成 1。
+// 结构仍由 Dart 正常释放；形状不符合预期时不做任何修改，绝不会破坏内存。
+typedef void *(*PFN_WireReturn)(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 
-static BOOL g_lateHooksDone = FALSE;
+static int WINAPI Hook_DisableInstallationInt(void) { return 1; }   // rustdesk_is_disable_installation
+static PFN_WireReturn g_realWireDisableInstallation = NULL;
 
-static BOOL PatchReturnTrue(LPVOID target) {
-    // 兜底：MinHook 挂不上（函数太短）时直接改机器码 mov eax,1; ret
-    DWORD old = 0;
-    if (!VirtualProtect(target, 6, PAGE_EXECUTE_READWRITE, &old)) return FALSE;
-    unsigned char code[6] = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3};
-    memcpy(target, code, sizeof(code));
-    VirtualProtect(target, 6, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), target, 6);
-    return TRUE;
+// 校验并改写 DartCObject(kArray[bool, bool]) 的第一个布尔值
+static void ForceFirstBoolTrue(void *obj) {
+    if (!obj) return;
+    int type = *(int *)obj;                        // Dart_CObject_kArray = 6（偏移 0）
+    intptr_t len = *(intptr_t *)((char *)obj + 8); // as_array.length（8 字节，偏移 8）
+    void **vals = *(void ***)((char *)obj + 16);   // as_array.values（偏移 16）
+    if (type != 6 || len != 2 || !vals || !vals[0]) return;
+
+    unsigned char *elem = (unsigned char *)vals[0];
+    int etype = *(int *)elem;                      // Dart_CObject_kBool = 1
+    if (etype != 1) return;
+    elem[8] = 1;                                   // union 里 as_bool 的字节（其余是填充）
 }
 
-static void EnsureLateHooks(void) {
-    if (g_lateHooksDone) return;
-    g_lateHooksDone = TRUE;
+static void *WINAPI Hook_WireDisableInstallation(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4) {
+    if (!g_realWireDisableInstallation) return NULL;   // 不该发生；宁可返回空也不猜
+    void *obj = g_realWireDisableInstallation(a1, a2, a3, a4);
+    ForceFirstBoolTrue(obj);
+    return obj;
+}
 
-    // 逃生门：程序目录放一个名为 show-install-tip 的文件，就保留上游的安装提示
-    if (g_exeDir[0]) {
-        WCHAR opt[MAX_PATH + 24];
-        lstrcpynW(opt, g_exeDir, MAX_PATH + 24);
-        lstrcatW(opt, L"\\show-install-tip");
-        if (GetFileAttributesW(opt) != INVALID_FILE_ATTRIBUTES) {
-            LogA("show-install-tip marker present, keep install tip");
-            return;
-        }
-    }
+// 程序目录放 show-install-tip 文件 → 保留上游提示，不做任何拦截
+static BOOL KeepInstallTip(void) {
+    if (!g_exeDir[0]) return FALSE;
+    WCHAR opt[MAX_PATH + 24];
+    lstrcpynW(opt, g_exeDir, MAX_PATH + 24);
+    lstrcatW(opt, L"\\show-install-tip");
+    return GetFileAttributesW(opt) != INVALID_FILE_ATTRIBUTES;
+}
+
+// 只在第一次 SHGetKnownFolderPath 之后装（见 Hook_SHGetKnownFolderPath）：
+// 那时 librustdesk.dll 早已初始化完毕，取导出、改代码都安全；
+// 而 DllMain 阶段本 DLL 正被 librustdesk.dll 导入，模块还没就绪。
+static void EnsureTipHooks(void) {
+    if (g_tipHooksDone) return;
+    g_tipHooksDone = TRUE;
+    if (KeepInstallTip()) { LogA("show-install-tip marker present, keep install tip"); return; }
 
     HMODULE lib = GetModuleHandleW(L"librustdesk.dll");
     if (!lib) { LogA("librustdesk.dll not loaded, skip install-tip hook"); return; }
 
-    const char *names[] = {"wire_is_disable_installation", "rustdesk_is_disable_installation"};
-    BOOL any = FALSE;
-    for (int i = 0; i < 2; i++) {
-        LPVOID p = (LPVOID)GetProcAddress(lib, names[i]);
-        if (!p) { LogA("export %s not found", names[i]); continue; }
-        MH_STATUS st = MH_CreateHook(p, &Hook_DisableInstallation, NULL);
-        if (st == MH_OK) {
-            any = TRUE;
-            LogA("hook %s ok", names[i]);
-        } else {
-            LogA("hook %s failed (%d), patching bytes", names[i], (int)st);
-            if (PatchReturnTrue(p)) any = TRUE;
-        }
+    LPVOID pWire = (LPVOID)GetProcAddress(lib, "wire_is_disable_installation");
+    if (pWire) {
+        MH_STATUS st = MH_CreateHook(pWire, &Hook_WireDisableInstallation,
+                                     (LPVOID *)&g_realWireDisableInstallation);
+        LogA("hook wire_is_disable_installation: %d", (int)st);
+        // 绝不能像整数返回那样改字节兜底：Dart 侧拿到假指针会直接崩。
+        if (st == MH_OK && MH_EnableHook(pWire) != MH_OK) g_realWireDisableInstallation = NULL;
+    } else {
+        LogA("export wire_is_disable_installation not found");
     }
-    if (any) MH_EnableHook(MH_ALL_HOOKS);   // 让新加的钩子生效
-    LogA("install-tip hook done (%d)", (int)any);
+
+    LPVOID pInt = (LPVOID)GetProcAddress(lib, "rustdesk_is_disable_installation");
+    if (pInt) {
+        MH_STATUS st = MH_CreateHook(pInt, &Hook_DisableInstallationInt, NULL);
+        LogA("hook rustdesk_is_disable_installation: %d", (int)st);
+        if (st == MH_OK) MH_EnableHook(pInt);
+    }
 }
 
 // ---------------------------------------------------------------- 抑制 UAC 探测风暴
@@ -334,7 +355,7 @@ static HRESULT WINAPI Hook_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwF
         CreateDirectoryW(g_roamingDir, NULL);   // 调用方通常期望目录已存在
 
         // 第一次被调用说明已离开 DllMain 的加载器锁，可以安全地装第二批钩子/起线程
-        EnsureLateHooks();
+        EnsureTipHooks();
         if (InterlockedCompareExchange(&g_showStarted, 1, 0) == 0) {
             HANDLE t = CreateThread(NULL, 0, ShowWindowThread, NULL, 0, NULL);
             if (t) CloseHandle(t);
@@ -384,6 +405,8 @@ static void EnsureInit(void) {
                               &Hook_CreateProcessW, (LPVOID *)&g_realCreateProcessW);
         LogA("hook CreateProcessW: %d (nop=%ls)", (int)st, g_nopPath);
     }
+
+    if (!KeepInstallTip()) LogA("install-tip hook deferred to first folder query");
 
     if (g_trayMode) {
         st = MH_CreateHookApi(L"user32.dll", "TrackPopupMenu",

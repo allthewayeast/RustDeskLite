@@ -75,14 +75,19 @@ RustDesk 的配置目录由 `hbb_common::config::Config::path()` 决定，Window
   直接比对），所以构建时把 `-Password` 原样写进去即可；客户端下次保存配置时会用「机器 UUID 派生的密钥」
   自动转成 `01...` 密文。也正因为密钥与目标机器绑定，**无法在构建机上预先生成密文**。
 - **去除「未安装版本」提示**：首页那张红卡的条件是 `Windows && !isDisableInstallation() && !isInstalled()`
-  （`desktop_home_page.dart:461`）。Hook 直接把 `librustdesk.dll` 的导出
-  `wire_is_disable_installation` / `rustdesk_is_disable_installation` 改成恒返回 1，
-  卡片就不再出现；Rust 内部对 `is_installed()` 的判断不受影响，便携行为不变。
-  想保留提示：在程序目录放一个名为 `show-install-tip` 的空文件即可。
-- **去除「未安装版本」提示**：首页那张红卡的条件是 `Windows && !isDisableInstallation() && !isInstalled()`
-  （`desktop_home_page.dart:461`）。Hook 直接把 `librustdesk.dll` 的导出
-  `wire_is_disable_installation` / `rustdesk_is_disable_installation` 改成恒返回 1，
-  卡片就不再出现；Rust 内部对 `is_installed()` 的判断不受影响，便携行为不变。
+  （`desktop_home_page.dart:461`），所以只要让 Dart 侧的 `isDisableInstallation()` 返回 `true` 就不会显示。
+  它走 flutter_rust_bridge 生成的导出 `wire_is_disable_installation()`，返回值是
+  `WireSyncReturn = *mut DartCObject`，实测是一个 `kArray[bool, bool]`：
+  `[0]` 是函数结果、`[1]` 是调用是否成功。
+  Hook 的做法是**先调用原函数**拿到由 Rust 正常分配的数组，再只把 `[0]` 的布尔字节改成 `1`：
+  结构、所有权、释放路径全部保持原样，Dart 侧读到的仍是合法的 `SyncReturn`。
+  > 一定要注意：这个导出**不能**像返回 `int` 的函数那样直接返回 `1`——Dart 会把 `1` 当对象指针解引用，
+  > 表现为 WerFault 弹窗 + 界面卡死。所以这里没有"改机器码 `mov eax,1; ret`"的兜底，
+  > MinHook 挂不上就放弃（宁可保留提示也不冒崩溃风险）。另一个导出
+  > `rustdesk_is_disable_installation` 返回 `int`，那个可以安全地恒返回 1。
+  >
+  > 安装时机也要注意：这两个钩子必须在**第一次 `SHGetKnownFolderPath` 之后**才装。
+  > `DllMain` 阶段本 DLL 正被 `librustdesk.dll` 导入，模块还没就绪，取导出会失败。
   想保留提示：在程序目录放一个名为 `show-install-tip` 的空文件即可。
 - **抑制 UAC 探测风暴**：RustDesk 在"未安装"模式下，采集循环**每帧**都会执行一次
   `tasklist | findstr consent.exe` 来探测 UAC 安全桌面（`video_service.rs:750` →
@@ -113,10 +118,15 @@ RustDeskLite/
 │  ├─ RustDeskLite.nsi      启动器脚本（解压 / 接管 / 启动 / 清理 / 唤起窗口）
 │  └─ app.ico               程序图标（建议 256×256 多尺寸）
 └─ hook/
-   ├─ sas_proxy.c           SAS.dll 源码：劫持 SHGetKnownFolderPath
+   ├─ sas_proxy.c           SAS.dll 源码：劫持 SHGetKnownFolderPath 等
    ├─ sas.def               导出表（转发 SendSAS）
-   ├─ test_probe.c          独立探针，验证重定向是否生效
-   ├─ build-hook.ps1        编译 SAS.dll（自动探测 MSVC + Windows SDK）
+   ├─ nop.c                 2.5 KB 空程序，替代每帧的 tasklist | findstr
+   ├─ build-hook.ps1        编译 SAS.dll / rdnop.exe（自动探测 MSVC + Windows SDK）
+   ├─ test-hook.ps1         自测入口：编译并运行各探针
+   ├─ test_fake_lib.c       假 librustdesk.dll（按 FRB 真实布局返回数组）
+   ├─ test_probe2.c         验证 install-tip Hook 改值不破坏返回结构（假 DLL）
+   ├─ test_probe5.c         同上，但加载真实的 librustdesk.dll
+   ├─ listimports.ps1       列出 PE 导入表（核对可劫持的 DLL）
    └─ minhook/              第三方 Hook 库（BSD-2-Clause）
 ```
 
@@ -195,6 +205,16 @@ pwsh build.ps1
 
 一键验证重定向是否生效：把 `SAS.dll` 和空文件 `portable` 放到 `rustdesk.exe` 同目录运行，
 配置应出现在该目录下的 `config\`，而 `%APPDATA%\RustDesk` 不变。
+
+自动验证 Hook 本身（不需要启动 RustDesk，也不会动你已装的版本）：
+
+```powershell
+pwsh hook\test-hook.ps1            # 假 librustdesk.dll：验证改值逻辑与返回结构
+pwsh hook\test-hook.ps1 -Only 5    # 真实 librustdesk.dll：把 DLL 复制到 out\selftest\RustDesk 里跑
+```
+
+`probe5` 必须让 `SAS.dll` 与 `librustdesk.dll` 处在**同一个名为 `RustDesk` 的目录**，
+否则 `librustdesk.dll` 会去 System32 找系统自带的 `SAS.dll`，Hook 根本不参与。
 
 ---
 
