@@ -26,7 +26,7 @@ param(
   [string]$AppImage = '',
   [string]$AppArgs = '',
   [string]$HookDll = '',
-  [int]$TrialDays = -1,
+  [int]$ValidDays = -1,
   [switch]$ReusePayload,
   [switch]$SkipCompile,
   [switch]$NoIcon,
@@ -65,10 +65,10 @@ $Mode       = Pick 'Mode'       'lite'
 $AppName    = Pick 'AppName'    'RustDesk Lite'
 $HookDll    = Pick 'HookDll'    (Join-Path $root 'hook\out\SAS.dll')
 
-# 有效期：0 或负数表示不限制；settings 里可写 TrialDays = 30
-if ($TrialDays -lt 0) {
-  if ($cfg.ContainsKey('TrialDays') -and "$($cfg['TrialDays'])" -ne '') { $TrialDays = [int]$cfg['TrialDays'] }
-  else { $TrialDays = 30 }
+# 有效期：0 或负数表示不限制；settings 里可写 ValidDays = 30
+if ($ValidDays -lt 0) {
+  if ($cfg.ContainsKey('ValidDays') -and "$($cfg['ValidDays'])" -ne '') { $ValidDays = [int]$cfg['ValidDays'] }
+  else { $ValidDays = 30 }
 }
 
 # 更新检查：默认关闭；命令行 -CheckUpdate 或 settings 里 CheckUpdate = $true 才保留
@@ -286,19 +286,19 @@ Write-Host "    并发标识: $launchGuid（互斥名 RustDeskLitePortableLaunch
 if ($iconOk) { $defs += "/DAPP_ICON=$iconPath" }
 if ($Password) { $defs += '/DHAS_PW' }
 if (Test-Path (Join-Path $cfgDir 'RustDesk_local.toml')) { $defs += '/DHAS_LOCAL_CFG' }
-$defs += "/DTRIAL_DAYS=$TrialDays"
+$defs += "/DTRIAL_DAYS=$ValidDays"
 
 # 有效期：编译日期与到期日都在这里算好，作为常量写死进 exe。
 # 不用 ${__DATE__}（格式随系统区域设置变化），也不用运行期推算。
-if ($TrialDays -gt 0) {
+if ($ValidDays -gt 0) {
   $buildDate  = (Get-Date).Date
-  $expireDate = $buildDate.AddDays($TrialDays)
+  $expireDate = $buildDate.AddDays($ValidDays)
   $defs += "/DBUILD_DATE=$($buildDate.ToString('yyyyMMdd'))"
   $defs += "/DBUILD_DATE_TEXT=$($buildDate.ToString('yyyy-MM-dd'))"
   $defs += "/DEXPIRE_DATE=$($expireDate.ToString('yyyyMMdd'))"
   $defs += "/DEXPIRE_DATE_TEXT=$($expireDate.ToString('yyyy-MM-dd'))"
   Write-Host ("    有效期: {0} 编译，{1} 到期（{2} 天）" -f `
-    $buildDate.ToString('yyyy-MM-dd'), $expireDate.ToString('yyyy-MM-dd'), $TrialDays) -ForegroundColor DarkGray
+    $buildDate.ToString('yyyy-MM-dd'), $expireDate.ToString('yyyy-MM-dd'), $ValidDays) -ForegroundColor DarkGray
 } else {
   Write-Host "    有效期: 不限制" -ForegroundColor DarkGray
 }
